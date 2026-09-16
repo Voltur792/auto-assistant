@@ -1,0 +1,4 @@
+{
+  "listing.name": "Auto Assistant",
+  "listing.description": "Automatic assistant: reads mail (Yandex/Gmail over IMAP), triages it with an allow-list or Astra's own LLM, builds a digest with tasks and reminders, and fires a trigger your automations can react to."
+}

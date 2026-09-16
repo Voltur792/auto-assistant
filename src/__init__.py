@@ -1,0 +1,1 @@
+"""Auto Assistant plugin package."""

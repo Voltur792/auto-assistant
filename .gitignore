@@ -1,0 +1,12 @@
+# Build artifacts
+*.astraplugin
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# App passwords and digest live here — never commit.
+data/
+# Private notes — never commit.
+AGENTS.md
+публикация.txt

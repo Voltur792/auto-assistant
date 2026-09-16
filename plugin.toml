@@ -1,0 +1,36 @@
+[plugin]
+id = "auto-assistant"
+name = "Auto Assistant"
+version = "0.1.0"
+description = "Automatic assistant: reads mail (Yandex/Gmail over IMAP), triages it with an allow-list or Astra's own LLM, builds a digest with tasks and reminders, and fires a trigger your automations can react to."
+author = "Voltur"
+license = "MIT"
+
+[entry]
+command = "python"
+args = ["-m", "src.plugin"]
+cwd = "."
+runtimes = ["python"]
+
+# Что демон может вызывать ВНУТРЬ плагина.
+[capabilities]
+tools = true            # Astra может спрашивать дайджест в чате
+actions = true          # шаги для редактора автоматизаций (дайджест почты)
+triggers = true         # «важное письмо найдено» -> запускает команду пользователя
+ui_contributions = true # вкладка «Помощник»
+
+# Куда плагин имеет право звонить НАРУЖУ (default-deny). Reasons are shown on
+# the consent sheet untranslated, so they are in English (check N7).
+[permissions]
+send_chat_message = { reason = "Asks Astra (the model you configured in Astra) to triage new mail and create tasks/reminders — no extra API keys are used" }
+fire_trigger = { reason = "Starts your automation (for example, a voice announcement) when an important letter is found" }
+push_to_ui = { reason = "Refreshes the assistant tab when new mail arrives" }
+
+# Настройки живут во вкладке «Помощник» (пароли приложений, белый список) —
+# форма Astra здесь не нужна.
+[config]
+schema = "{ \"type\": \"object\", \"properties\": {} }"
+
+[platform]
+os = ["linux", "windows"]
+arch = ["x86_64"]

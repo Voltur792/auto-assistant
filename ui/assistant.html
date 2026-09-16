@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<script src="http://astra-plugin.localhost/bridge/astra-bridge.js"></script>
+<link rel="stylesheet" href="style.css">
+<title>Помощник</title>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>Авто-Помощник</h1>
+        <div class="header-right">
+            <span id="statusPill" class="status loading">Загрузка…</span>
+            <button id="refreshBtn" class="icon-btn" title="Проверить почту сейчас">⟳</button>
+        </div>
+    </header>
+
+<div class="tabs">
+<button class="tab-btn active" data-tab="digest">Дайджест</button>
+<button class="tab-btn" data-tab="mail">Почта</button>
+    </div>
+
+    <main>
+        <section id="tab-digest" class="tab-content active">
+            <div class="toolbar">
+                <button id="handoffBtn" class="btn" title="Попросить Астра создать задачи и напоминания по важным письмам (уже обработанные пропускаются)">✦ Создать задачи через Астра</button>
+                <button id="clearDigestBtn" class="btn">Очистить</button>
+            </div>
+            <div id="handoffNote" class="message" hidden></div>
+            <div id="digestList" class="stack">
+                <div class="placeholder"><div class="spinner"></div></div>
+            </div>
+        </section>
+
+        <section id="tab-mail" class="tab-content">
+            <div class="card">
+                <h3>Автопомощник</h3>
+                <div class="row">
+                    <label class="switch">
+                        <input type="checkbox" id="sEnabled">
+                        <span class="slider"></span>
+                    </label>
+                    <span class="row-label">Включён (периодическая проверка почты)</span>
+                </div>
+                <div class="grid2">
+                    <div class="form-group">
+                        <label>Интервал проверки, минут</label>
+                        <input type="number" id="sInterval" min="1" max="1440">
+                    </div>
+                    <div class="form-group">
+                        <label>Писем за проверку</label>
+                        <input type="number" id="sMax" min="1" max="100">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Режим отбора важных писем</label>
+                    <div id="sModeDD"></div>
+                </div>
+                <div class="form-group">
+                    <label>Сроки из писем записывать как</label>
+                    <div id="sDeadlineDD"></div>
+                </div>
+                <div class="row">
+                    <label class="switch">
+                        <input type="checkbox" id="sLlm">
+                        <span class="slider"></span>
+                    </label>
+                    <span class="row-label">Разбор умной моделью (LLM из настроек Astra, ключи не нужны)</span>
+                </div>
+                <div class="row">
+                    <label class="switch">
+                        <input type="checkbox" id="sHandoff">
+                        <span class="slider"></span>
+                    </label>
+                    <span class="row-label">Самой создавать у Астра задачи и напоминания по важным письмам</span>
+                </div>
+                <div class="row">
+                    <label class="switch">
+                        <input type="checkbox" id="sSkipAds" checked>
+                        <span class="slider"></span>
+                    </label>
+                    <span class="row-label">Экономия токенов: явную рекламу разбирать правилами, без LLM</span>
+                </div>
+                <div class="row">
+                    <label class="switch">
+                        <input type="checkbox" id="sVoice" checked>
+                        <span class="slider"></span>
+                    </label>
+                    <span class="row-label">Озвучивать голосом ответ Астры о созданных задачах (важные письма)</span>
+                </div>
+            </div>
+
+            <h3 class="section-title">Почтовые ящики</h3>
+            <div id="acctList" class="stack"></div>
+            <button id="addAcctBtn" class="btn add-btn">+ Добавить ящик</button>
+
+            <div class="card instructions">
+                <b>Пароль приложения</b> — не пароль от почты:
+                <ol>
+                    <li><b>Яндекс:</b> id.yandex.ru → Безопасность → Пароли приложений → «Почта (IMAP)». Настроить → Почта → «Портал IMAP-клиентов» — включить.</li>
+                    <li><b>Gmail:</b> аккаунт → Безопасность → 2-Step Verification (вкл) → App passwords → создать для Mail.</li>
+                    <li>Белый список — подстроки адреса или имени отправителя, по одному в строке. Пустой = проходить всем.</li>
+                </ol>
+                Пароли хранятся локально в <code>%APPDATA%\auto-assistant</code> — переживают переустановку плагина.
+            </div>
+
+            <div class="toolbar save-bar">
+                <span id="globalMsg" class="message"></span>
+                <button id="saveBtn" class="btn">💾 Сохранить</button>
+            </div>
+        </section>
+    </main>
+</div>
+<script src="script.js"></script>
+</body>
+</html>
