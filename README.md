@@ -182,3 +182,9 @@ astra-plugin build .
 ## Лицензия
 
 [MIT](LICENSE)
+
+## Поддержать автора
+
+Если плагин оказался полезным, можно поддержать разработку:
+
+**[boosty.to/voltur/donate](https://boosty.to/voltur/donate)**
