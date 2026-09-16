@@ -7,6 +7,9 @@ __pycache__/
 .venv/
 # App passwords and digest live here — never commit.
 data/
+# Store icon ships as icon.png; source artwork (JPG etc.) stays out of the
+# plugin folder so the packer cannot pick it up instead.
+design/
 # Private notes — never commit.
 AGENTS.md
 публикация.txt
