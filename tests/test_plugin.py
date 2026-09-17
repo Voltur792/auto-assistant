@@ -54,3 +54,40 @@ def test_astra_task_counts_best_effort(tmp_path, monkeypatch):
     assert AstraAutoAssistant._astra_task_counts() is None
     (cfg / "calendar.json").unlink()
     assert AstraAutoAssistant._astra_task_counts() is None
+
+
+def test_own_mail_is_high_in_digest_summary_and_handoff_list(tmp_path, monkeypatch):
+    # Regression (18.09, real): a letter from the user's own account was
+    # marked high only in the digest COPY of the verdict — the trigger fired,
+    # but the handoff list was built from the raw LLM/rules verdict ("normal"),
+    # so no tasks were ever requested. Digest, summary and the handoff list
+    # must all see the same final verdict.
+    import asyncio
+    import time as _time
+
+    from src import mailer, store
+
+    monkeypatch.setattr(store, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(store, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(store, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(store, "_migrated", False)
+    acct = {"id": "a1", "provider": "yandex", "email": "me@ya.ru",
+            "password": "pw", "imap_host": "", "imap_port": 993,
+            "enabled": True, "whitelist": []}
+    store.save_settings({**store.DEFAULT_SETTINGS, "accounts": [acct],
+                          "mode": "rules", "llm_enabled": False,
+                          "auto_handoff": False})
+    letters = [{"uid": "5", "from_name": "Я", "from_addr": "me@ya.ru",
+                "subject": "Тестовое собрание", "ts": _time.time(),
+                "body": "тест"}]
+    monkeypatch.setattr(mailer, "fetch_new_emails",
+                        lambda a, base, limit: (letters, 5))
+
+    plugin = AstraAutoAssistant()
+    plugin._poll_lock = asyncio.Lock()
+    report = asyncio.run(plugin.poll_once(auto=False))
+
+    state = store.load_state()
+    assert state["digest"][0]["importance"] == "high"
+    assert "важных 1" in report       # the summary counts it too
+    assert state["acct_status"]["a1"]["new_count"] == 1

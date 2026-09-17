@@ -202,6 +202,19 @@ def test_digest_cap_and_legacy_keys_dropped(store_env):
     assert "seen_uids" not in again and "events" not in again
 
 
+def test_add_digest_item_replaces_a_refetched_letter(store_env):
+    # A rewind or a refetch re-delivers a letter that is already in the
+    # digest: it must replace the old entry, not duplicate it, and keep the
+    # handled mark so Astra is not asked for the same tasks twice.
+    assert store.add_digest_item({"id": "a:5", "importance": "normal"}) is True
+    store.mark_digest_handled(["a:5"])
+    assert store.add_digest_item({"id": "a:5", "importance": "high"}) is False
+    state = store.load_state()
+    assert len(state["digest"]) == 1
+    assert state["digest"][0]["importance"] == "high"
+    assert state["digest"][0]["handled"] is True
+
+
 def test_recent_digest(store_env):
     store.add_digest_item({"id": "now", "ts": time.time()})
     store.add_digest_item({"id": "old", "ts": time.time() - 100 * 3600})

@@ -136,10 +136,53 @@ def test_rewind_on_a_mailbox_without_unread_returns_none(fake):
     assert mailer.rewind_baseline(ACCOUNT, 20) is None
 
 
+def test_a_letter_that_fails_to_fetch_is_retried_then_skipped(monkeypatch):
+    # 101 ok, 102 fails on every attempt, 103 ok: the poller must neither
+    # stall on the poison letter (the "no new mail" bug again) nor lose the
+    # letters after it.
+    class FlakyIMAP(FakeIMAP):
+        def __init__(self):
+            super().__init__([101, 102, 103], [101, 102, 103])
+            self.fetch_attempts = {}
+
+        def uid(self, command, *args):
+            if command == "fetch":
+                uid = int(args[0])
+                self.fetch_attempts[uid] = self.fetch_attempts.get(uid, 0) + 1
+                if uid == 102:
+                    raise OSError("fetch glitch")
+                return super().uid(command, *args)
+            return super().uid(command, *args)
+
+    conn = FlakyIMAP()
+    monkeypatch.setattr(mailer, "_connect", lambda account: conn)
+    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=10)
+    assert [m["uid"] for m in msgs] == ["101", "103"]   # 102 skipped...
+    assert conn.fetch_attempts[102] == 2                # ...after a retry
+    assert high == 103                                   # and the queue flows
+
+
+def test_a_transient_fetch_glitch_is_covered_by_the_retry(monkeypatch):
+    # Fails once, succeeds on the retry: the letter must NOT be lost.
+    class OnceIMAP(FakeIMAP):
+        def __init__(self):
+            super().__init__([101, 102], [101, 102])
+            self.failed_once = False
+
+        def uid(self, command, *args):
+            if command == "fetch" and int(args[0]) == 102 and not self.failed_once:
+                self.failed_once = True
+                raise OSError("transient")
+            return super().uid(command, *args)
+
+    conn = OnceIMAP()
+    monkeypatch.setattr(mailer, "_connect", lambda account: conn)
+    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=10)
+    assert [m["uid"] for m in msgs] == ["101", "102"]
+    assert high == 102
+
+
 def test_html_style_and_script_do_not_leak_into_the_body(monkeypatch):
-    # Regression: stripping tags alone leaves the CSS in the preview, and
-    # summaries like "/* Mobile-first responsive styles */ @media..." went
-    # into the digest and the LLM prompt instead of the letter's text.
     msg = email.message.EmailMessage()
     msg["From"] = "Boss <boss@example.com>"
     msg["To"] = "me@example.com"

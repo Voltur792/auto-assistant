@@ -118,7 +118,10 @@ class AstraAutoAssistant(Plugin):
 
     async def poll_once(self, auto: bool) -> str:
         """Check every enabled account once; triage what is new."""
-        assert self._poll_lock is not None
+        if self._poll_lock is None:
+            # Normally created by _ensure_poller(); a UI call that wins the
+            # race against the first config delivery must not crash.
+            self._poll_lock = asyncio.Lock()
         if self._poll_lock.locked():
             return "Проверка почты уже выполняется — подожди немного."
         async with self._poll_lock:
@@ -229,18 +232,23 @@ class AstraAutoAssistant(Plugin):
                         self._llm_error = f"режим «{mode}» не использует LLM"
                 triaged = analyze.merge_llm(new_items, parsed, llm_idx=llm_idx)
 
-                # Verdict overrides, strongest first: mail from the user's own
-                # account is always high (a note to self / a test — nothing in
-                # the rules or the model scores it), bulk mail is never high.
+                # Final verdict, strongest first: mail from the user's own
+                # account is always high (a note to self / a test — neither
+                # the keyword rules nor the model scores it), bulk senders
+                # are never high. Applied to the triaged item ITSELF: an
+                # override that only touched the digest copy left the letter
+                # "important" in the tab while the handoff list (built from
+                # the raw verdicts) stayed empty — the trigger fired and no
+                # tasks were ever requested.
                 own_addrs = {(a.get("email") or "").strip().casefold()
                              for a in settings.get("accounts") or []} - {""}
                 for it in triaged:
                     if it.get("from_addr", "").casefold() in own_addrs:
-                        verdict = "high"
+                        it["importance"] = "high"
                     elif it.get("bulk"):
-                        verdict = "low"
-                    else:
-                        verdict = it.get("importance", "normal")
+                        it["importance"] = "low"
+
+                for it in triaged:
                     digest_item = {
                         "id": f"{it.get('account_id')}:{it['uid']}",
                         "ts": time.time(),
@@ -250,14 +258,17 @@ class AstraAutoAssistant(Plugin):
                         "from_name": it.get("from_name", ""),
                         "from_addr": it.get("from_addr", ""),
                         "subject": it.get("subject", ""),
-                        "importance": verdict,
+                        "importance": it.get("importance", "normal"),
                         "summary": it.get("summary", ""),
                         "tasks": it.get("tasks", []),
                         "reminders": it.get("reminders", []),
                         "source": source,
                     }
-                    store.add_digest_item(digest_item)
-                    if digest_item["importance"] == "high":
+                    # Only a NEW digest entry fires the trigger: a letter
+                    # re-fetched after a rewind or a failed fetch must not
+                    # re-announce itself.
+                    if store.add_digest_item(digest_item) and \
+                            digest_item["importance"] == "high":
                         await self._fire_important(digest_item)
 
             state = store.load_state()

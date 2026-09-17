@@ -219,17 +219,31 @@ def save_state(state: Dict[str, Any]) -> None:
         _write(STATE_FILE, state)
 
 
-def add_digest_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Prepend a digest item (newest first) and persist."""
+def add_digest_item(item: Dict[str, Any]) -> bool:
+    """Prepend a digest item (newest first) and persist.
+
+    Returns True when the item is new. A letter re-fetched after a rewind or
+    a failed fetch arrives with the same id — it REPLACES the old entry in
+    place (the digest must not show one letter twice) and keeps `handled`, so
+    a re-triaged letter does not ask Astra for the same tasks twice.
+    """
     with _LOCK:
         state = load_state()
         digest = state.get("digest")
         if not isinstance(digest, list):
             digest = []
+        for i, old in enumerate(digest):
+            if old.get("id") == item.get("id"):
+                if old.get("handled"):
+                    item["handled"] = True
+                digest[i] = item
+                state["digest"] = digest
+                save_state(state)
+                return False
         digest.insert(0, item)
         state["digest"] = digest
         save_state(state)
-        return state
+        return True
 
 
 def clear_digest() -> None:

@@ -139,15 +139,25 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
         typ, data = conn.uid("search", "UNSEEN")
         fresh = [u for u in _uids(typ, data) if u > since][: max(limit, 1)]
         for uid in fresh:
-            typ, msg_data = conn.uid("fetch", str(uid), "(BODY.PEEK[])")
-            if typ != "OK" or not msg_data:
-                continue
-            raw = next((p[1] for p in msg_data if isinstance(p, tuple)), None)
-            if raw is None:
-                continue
-            try:
-                msg = email.message_from_bytes(raw, policy=email.policy.default)
-            except Exception:
+            msg = None
+            # One retry covers transient fetch glitches. A letter that still
+            # fails is skipped, not fatal: the baseline moves past it either
+            # way, and a poller that stops at a poison letter forever is the
+            # "no new mail" bug again — losing one unreadable letter is the
+            # smaller evil.
+            for _attempt in (1, 2):
+                try:
+                    typ, msg_data = conn.uid("fetch", str(uid), "(BODY.PEEK[])")
+                    if typ == "OK" and msg_data:
+                        raw = next((p[1] for p in msg_data
+                                    if isinstance(p, tuple)), None)
+                        if raw is not None:
+                            msg = email.message_from_bytes(
+                                raw, policy=email.policy.default)
+                            break
+                except Exception:
+                    continue
+            if msg is None:
                 continue
             from_name, from_addr = parseaddr(msg.get("From", ""))
             try:
@@ -163,7 +173,7 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
                 "ts": ts,
                 "body": _decode_body(msg),
             })
-        return out, (max(fresh) if fresh else since)
+        return out, (max(int(m["uid"]) for m in out) if out else since)
     finally:
         try:
             conn.logout()
