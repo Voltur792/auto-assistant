@@ -51,9 +51,25 @@ def test_rules_date_plus_one_high_word_is_high():
     assert v2["importance"] == "low"
 
 
-def test_never_noise_senders():
-    assert analyze.is_never("newsletter@shop.ru")
-    assert not analyze.is_never("boss@company.com")
+def test_bulk_senders_are_narrow():
+    assert analyze.is_bulk("newsletter@shop.ru")
+    assert analyze.is_bulk("Promo@Shop.RU")
+    assert not analyze.is_bulk("boss@company.com")
+    # Регресс: noreply@ раньше означал «выбросить не глядя», хотя с таких
+    # адресов пишут банки и госуслуги — письма молча пропадали.
+    for addr in ("noreply@bank.ru", "no-reply@company.com", "news@steam.com",
+                 "mailer@service.io"):
+        assert not analyze.is_bulk(addr)
+
+
+def test_own_mail_is_recognized():
+    # Регресс: тестовое письмо от самого себя правила звали «обычным» —
+    # слова «тест»/«собрание» в _HIGH_WORDS нет, и LLM тоже сказал normal.
+    accounts = [{"email": "me@ya.ru"}, {"email": "Me@Gmail.com "}]
+    assert analyze.is_own_mail("me@ya.ru", accounts)
+    assert analyze.is_own_mail("ME@GMAIL.COM", accounts)   # регистр/пробелы
+    assert not analyze.is_own_mail("boss@company.com", accounts)
+    assert not analyze.is_own_mail("", accounts)
 
 
 def test_parse_llm_answer_plain_and_chatty():

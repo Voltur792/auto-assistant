@@ -81,7 +81,12 @@ def _decode_body(msg: Any) -> str:
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="replace")
         if part.get_content_type() == "text/html":
+            # Style/script blocks and comments are not text: stripping tags
+            # alone leaves the CSS in the preview (and in the LLM prompt).
             import re
+            content = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>", " ",
+                             content)
+            content = re.sub(r"(?s)<!--.*?-->", " ", content)
             content = re.sub(r"<[^>]+>", " ", content)
         # Collapse all whitespace: the preview is fed to rules/LLM, not shown raw.
         return " ".join(content.split())[:_BODY_PREVIEW_CHARS]

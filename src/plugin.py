@@ -174,8 +174,10 @@ class AstraAutoAssistant(Plugin):
                     baselined.append(acct.get("email", ""))
                 fresh: List[Dict[str, Any]] = []
                 for m in msgs:
-                    if analyze.is_never(m["from_addr"]):
-                        continue
+                    # Bulk mail is marked, never dropped: a sender that looks
+                    # automated is not a reason to hide a letter, and a filter
+                    # that deletes mail silently reads as a broken poller.
+                    m["bulk"] = analyze.is_bulk(m["from_addr"])
                     if mode in ("whitelist", "whitelist_llm") and \
                             not analyze.match_whitelist(acct, m["from_addr"],
                                                         m["from_name"]):
@@ -208,7 +210,9 @@ class AstraAutoAssistant(Plugin):
                         it.get("subject", ""), it.get("body", ""))
                         for it in new_items]
                     llm_idx = [i for i, v in enumerate(rules_first)
-                               if not (skip_ads and v["importance"] == "low")]
+                               if not (skip_ads and (
+                                   v["importance"] == "low"
+                                   or new_items[i].get("bulk")))]
                     if llm_idx:
                         answer = await self._ask_astra(analyze.build_llm_prompt(
                             [new_items[i] for i in llm_idx]))
@@ -225,7 +229,18 @@ class AstraAutoAssistant(Plugin):
                         self._llm_error = f"режим «{mode}» не использует LLM"
                 triaged = analyze.merge_llm(new_items, parsed, llm_idx=llm_idx)
 
+                # Verdict overrides, strongest first: mail from the user's own
+                # account is always high (a note to self / a test — nothing in
+                # the rules or the model scores it), bulk mail is never high.
+                own_addrs = {(a.get("email") or "").strip().casefold()
+                             for a in settings.get("accounts") or []} - {""}
                 for it in triaged:
+                    if it.get("from_addr", "").casefold() in own_addrs:
+                        verdict = "high"
+                    elif it.get("bulk"):
+                        verdict = "low"
+                    else:
+                        verdict = it.get("importance", "normal")
                     digest_item = {
                         "id": f"{it.get('account_id')}:{it['uid']}",
                         "ts": time.time(),
@@ -235,7 +250,7 @@ class AstraAutoAssistant(Plugin):
                         "from_name": it.get("from_name", ""),
                         "from_addr": it.get("from_addr", ""),
                         "subject": it.get("subject", ""),
-                        "importance": it.get("importance", "normal"),
+                        "importance": verdict,
                         "summary": it.get("summary", ""),
                         "tasks": it.get("tasks", []),
                         "reminders": it.get("reminders", []),

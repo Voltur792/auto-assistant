@@ -134,3 +134,29 @@ def test_rewind_with_fewer_unread_than_asked_takes_them_all(fake):
 def test_rewind_on_a_mailbox_without_unread_returns_none(fake):
     fake(range(1, 101), [])
     assert mailer.rewind_baseline(ACCOUNT, 20) is None
+
+
+def test_html_style_and_script_do_not_leak_into_the_body(monkeypatch):
+    # Regression: stripping tags alone leaves the CSS in the preview, and
+    # summaries like "/* Mobile-first responsive styles */ @media..." went
+    # into the digest and the LLM prompt instead of the letter's text.
+    msg = email.message.EmailMessage()
+    msg["From"] = "Boss <boss@example.com>"
+    msg["To"] = "me@example.com"
+    msg["Subject"] = "s"
+    msg.set_content(
+        "<html><head><style>p{color:red}</style></head>"
+        "<body><!-- hidden --><p>Настоящий текст письма</p></body></html>",
+        subtype="html")
+    raw = msg.as_bytes()
+
+    class HtmlIMAP(FakeIMAP):
+        def uid(self, command, *args):
+            if command == "fetch":
+                return "OK", [(b"1 (UID 5 BODY[] {1}", raw), b")"]
+            return super().uid(command, *args)
+
+    conn = HtmlIMAP([5], [5])
+    monkeypatch.setattr(mailer, "_connect", lambda account: conn)
+    msgs, _ = mailer.fetch_new_emails(ACCOUNT, 0, limit=5)
+    assert msgs[0]["body"] == "Настоящий текст письма"

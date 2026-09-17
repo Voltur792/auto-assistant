@@ -40,8 +40,12 @@ _LOW_WORDS = (
 # "оплатить до 31.12.2026" — a deadline is the point of the letter.
 _DATE_RE = re.compile(r"\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?")
 
-# Senders that are always noise regardless of mode (never LLM'd, never digested).
-_NEVER_WORDS = ("noreply@", "no-reply@", "mailer@", "newsletter@", "news@", "mailing@")
+# Bulk-mail senders: forced to "low" (so skip_ads_llm keeps them out of the
+# LLM) but still shown. They are NOT dropped — an address like noreply@ says
+# nothing about importance (banks, tickets and government write from it), and a
+# filter that silently deletes mail is indistinguishable from a broken poller.
+_BULK_WORDS = ("newsletter@", "mailing@", "promo@", "marketing@", "ads@",
+               "sales-notif@", "subscribe@")
 
 _IMPORTANCE_ORDER = {"high": 2, "normal": 1, "low": 0}
 
@@ -81,9 +85,24 @@ def classify_rules(subject: str, body: str) -> Dict[str, Any]:
     return {"importance": importance, "summary": summary}
 
 
-def is_never(from_addr: str) -> bool:
+def is_bulk(from_addr: str) -> bool:
+    """True for addresses that are bulk mail by construction (newsletters)."""
     addr = from_addr.casefold()
-    return any(w in addr for w in _NEVER_WORDS)
+    return any(w in addr for w in _BULK_WORDS)
+
+
+def is_own_mail(from_addr: str, accounts: Any) -> bool:
+    """True when the letter was sent from one of the user's own accounts.
+
+    Such mail is a note to self or a test. The keyword rules have no score for
+    «тестовое собрание» (and the LLM calls it normal too), so a test letter
+    used to sink into the middle of the digest — even though it is mail from
+    the sender the user watches most: themselves.
+    """
+    addr = (from_addr or "").casefold()
+    return bool(addr) and any(
+        isinstance(a, dict) and (a.get("email") or "").strip().casefold() == addr
+        for a in (accounts or []))
 
 
 def build_llm_prompt(items: List[Dict[str, Any]]) -> str:
