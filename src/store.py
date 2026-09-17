@@ -62,8 +62,7 @@ _LEGACY_ID_DATA_DIRS = [
 ]
 _migrated = False
 
-# Cap growing lists so the JSON files stay small.
-_MAX_SEEN_PER_ACCOUNT = 500
+# Cap the digest so state.json stays small.
 _MAX_DIGEST = 200
 
 _LOCK = threading.RLock()
@@ -89,8 +88,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 
 DEFAULT_STATE: Dict[str, Any] = {
-    "seen_uids": {},     # account_id -> [uid, ...]
-    "acct_status": {},   # account_id -> {last_poll, last_error, new_count}
+    # account_id -> {last_poll, last_error, new_count, last_uid}. last_uid is
+    # the highest IMAP UID the plugin has accounted for — the mail baseline.
+    # It replaces the old seen_uids list, which held IMAP *sequence numbers*:
+    # those are positions that shift when mail is deleted or archived, so new
+    # letters kept matching "already seen" and the poller reported nothing.
+    "acct_status": {},
     "digest": [],        # [{id, account_id, account_email, from_addr, from_name, subject, ts, importance, summary, tasks[], reminders[], source}]
     "last_poll": 0.0,
     "last_error": "",
@@ -206,12 +209,11 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(state: Dict[str, Any]) -> None:
     with _LOCK:
-        # Cap the growing lists so state.json stays small.
-        seen = state.get("seen_uids") or {}
-        for acct, uids in seen.items():
-            if isinstance(uids, list) and len(uids) > _MAX_SEEN_PER_ACCOUNT:
-                seen[acct] = uids[-_MAX_SEEN_PER_ACCOUNT:]
-        state["seen_uids"] = seen
+        # Legacy keys, dropped on write: seen_uids held IMAP sequence numbers
+        # (unstable — see mailer.fetch_new_emails) and events belonged to the
+        # removed Telegram bridge.
+        state.pop("seen_uids", None)
+        state.pop("events", None)
         if isinstance(state.get("digest"), list):
             state["digest"] = state["digest"][:_MAX_DIGEST]
         _write(STATE_FILE, state)
@@ -250,22 +252,6 @@ def mark_digest_handled(ids: List[str]) -> None:
                 changed = True
         if changed:
             save_state(state)
-
-
-def is_seen(account_id: str, uid: str) -> bool:
-    with _LOCK:
-        state = load_state()
-        return uid in (state.get("seen_uids", {}).get(account_id) or [])
-
-
-def mark_seen(account_id: str, uids: List[str]) -> None:
-    with _LOCK:
-        state = load_state()
-        seen = state.setdefault("seen_uids", {})
-        cur = set(seen.get(account_id) or [])
-        cur.update(uids)
-        seen[account_id] = list(cur)[-_MAX_SEEN_PER_ACCOUNT:]
-        save_state(state)
 
 
 def recent_digest(hours: float, account_id: Optional[str] = None) -> List[Dict[str, Any]]:

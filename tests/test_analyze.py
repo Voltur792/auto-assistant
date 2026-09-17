@@ -131,11 +131,11 @@ def test_migrates_legacy_settings_once(store_env):
         json.dumps({"accounts": [{"email": "a@b.c", "password": "secret"}]}),
         encoding="utf-8")
     (legacy / "state.json").write_text(
-        json.dumps({"seen_uids": {"x": ["1"]}}), encoding="utf-8")
+        json.dumps({"acct_status": {"x": {"last_uid": 123}}}), encoding="utf-8")
     s = store.load_settings()
     assert s["accounts"][0]["password"] == "secret"
     assert (store_env / "settings.json").exists()
-    assert store.load_state()["seen_uids"]["x"] == ["1"]
+    assert store.load_state()["acct_status"]["x"]["last_uid"] == 123
 
 
 def test_migrates_old_id_data_dir(store_env):
@@ -171,15 +171,19 @@ def test_settings_roundtrip_and_defaults(store_env):
     assert again["accounts"][0]["id"]  # id was assigned on normalize
 
 
-def test_digest_and_seen_caps(store_env):
+def test_digest_cap_and_legacy_keys_dropped(store_env):
     for i in range(250):
         store.add_digest_item({"id": f"d{i}", "ts": time.time()})
     state = store.load_state()
     assert len(state["digest"]) == 200
     assert state["digest"][0]["id"] == "d249"     # newest first
-    store.mark_seen("acct1", [str(i) for i in range(1000)])
-    state = store.load_state()
-    assert len(state["seen_uids"]["acct1"]) == store._MAX_SEEN_PER_ACCOUNT
+    # Old state files carried seen_uids (IMAP sequence numbers, meaningless
+    # now) and events (removed Telegram bridge) — they must not survive a save.
+    state["seen_uids"] = {"acct1": ["1", "2"]}
+    state["events"] = []
+    store.save_state(state)
+    again = store.load_state()
+    assert "seen_uids" not in again and "events" not in again
 
 
 def test_recent_digest(store_env):

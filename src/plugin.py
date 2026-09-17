@@ -135,29 +135,43 @@ class AstraAutoAssistant(Plugin):
             new_items: List[Dict[str, Any]] = []
             errors: List[str] = []
             acct_updates: Dict[str, Any] = {}
+            status_prev = state.get("acct_status") or {}
+            baselined: List[str] = []
             for acct in settings.get("accounts") or []:
                 if not acct.get("enabled", True):
                     continue
                 acct_id = acct.get("id") or acct.get("email")
+                prev = status_prev.get(acct_id) or {}
                 if not (acct.get("email") and acct.get("password")):
                     acct_updates[acct_id] = {
+                        **prev,
                         "last_poll": time.time(),
                         "last_error": "Не заполнен адрес или пароль приложения",
                         "new_count": 0,
                     }
                     continue
-                seen = set(state.get("seen_uids", {}).get(acct_id) or [])
+                # Baseline = highest IMAP UID already accounted for. Missing
+                # means "never polled" and the first poll only learns where the
+                # mailbox ends, so an install does not triage its whole history.
+                baseline = prev.get("last_uid")
                 try:
-                    msgs = await asyncio.to_thread(
-                        mailer.fetch_new_emails, acct, seen, max(limit, 1))
+                    baseline = None if baseline is None else int(baseline)
+                except (TypeError, ValueError):
+                    baseline = None
+                try:
+                    msgs, uid_high = await asyncio.to_thread(
+                        mailer.fetch_new_emails, acct, baseline, max(limit, 1))
                 except Exception as e:
                     errors.append(f"{acct.get('email')}: {e}")
                     acct_updates[acct_id] = {
+                        **prev,
                         "last_poll": time.time(),
                         "last_error": str(e)[:300],
                         "new_count": 0,
                     }
                     continue
+                if baseline is None:
+                    baselined.append(acct.get("email", ""))
                 fresh: List[Dict[str, Any]] = []
                 for m in msgs:
                     if analyze.is_never(m["from_addr"]):
@@ -169,13 +183,13 @@ class AstraAutoAssistant(Plugin):
                     m["account_id"] = acct_id
                     m["account_email"] = acct.get("email", "")
                     fresh.append(m)
-                if msgs:
-                    store.mark_seen(acct_id, [m["uid"] for m in msgs])
                 new_items.extend(fresh)
                 acct_updates[acct_id] = {
+                    **prev,
                     "last_poll": time.time(),
                     "last_error": "",
                     "new_count": len(fresh),
+                    "last_uid": uid_high,
                 }
 
             triaged: List[Dict[str, Any]] = []
@@ -244,9 +258,13 @@ class AstraAutoAssistant(Plugin):
             store.save_state(state)
 
             high = [t for t in triaged if t.get("importance") == "high"]
+            note = ""
+            if baselined:
+                note = (" Точка отсчёта установлена — дальше сообщаю только о "
+                        "письмах, пришедших после неё.")
             self._last_summary = (
                 f"Почта проверена: новых писем {len(new_items)}, "
-                f"важных {len(high)}." + (f" Ошибки: {errors[0]}" if errors else "")
+                f"важных {len(high)}." + note + (f" Ошибки: {errors[0]}" if errors else "")
             )
             try:
                 await self.push_to_ui("assistant", {"type": "updated"})

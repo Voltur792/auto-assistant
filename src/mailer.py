@@ -13,7 +13,7 @@ import email
 import email.policy
 import imaplib
 from email.utils import parseaddr, parsedate_to_datetime
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional
 
 PROVIDER_HOSTS: Dict[str, "tuple[str, int]"] = {
     "yandex": ("imap.yandex.ru", 993),
@@ -89,30 +89,52 @@ def _decode_body(msg: Any) -> str:
         return ""
 
 
-def fetch_new_emails(account: Dict[str, Any], seen_ids: Set[str],
-                     limit: int = 20) -> List[Dict[str, Any]]:
-    """Newest unread messages of INBOX that are not in `seen_ids`.
+def _uids(typ: Any, data: Any) -> List[int]:
+    """Parse a SEARCH/UID SEARCH response into sorted ints."""
+    if typ != "OK" or not data or not data[0]:
+        return []
+    try:
+        return sorted(int(x) for x in data[0].split())
+    except ValueError:
+        return []
 
-    Blocking — run it in a worker thread. Fetches candidates newest-first and
-    stops after `limit` new ones (or after `limit + 40` candidates, so a
-    mailbox with hundreds of old unread letters does not stall the poller).
+
+def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
+                     limit: int = 20) -> "tuple[List[Dict[str, Any]], int]":
+    """Unread INBOX messages with UID > `since_uid`, oldest first.
+
+    Blocking — run it in a worker thread.
+
+    UIDs, never sequence numbers: a sequence number is a *position* in the
+    mailbox and it shifts down every time anything is deleted or archived, so
+    a "already seen" list built from them quietly swallows new mail — with a
+    mailbox of ~20k messages the newest letters kept landing on numbers the
+    plugin had stored weeks earlier, and every poll reported "nothing new".
+    A UID is permanent for the life of the mailbox.
+
+    `since_uid=None` means "never polled": nothing is returned and the second
+    element is the mailbox's current highest UID, which the caller stores as
+    the baseline so a fresh install does not spend its first polls triaging
+    years of old unread mail.
+
+    Returns `(messages, uid_high)` — `uid_high` is what to store as the new
+    baseline. At most `limit` messages come back, oldest first, so a flood is
+    worked through over several polls instead of the older half being dropped.
+    Messages are read with BODY.PEEK, so nothing is ever marked as read.
     """
     conn = _connect(account)
     out: List[Dict[str, Any]] = []
     try:
         conn.select("INBOX", readonly=True)
-        typ, data = conn.search(None, "UNSEEN")
-        if typ != "OK" or not data or not data[0]:
-            return out
-        ids = data[0].split()
-        candidates = ids[::-1][: limit + 40]  # newest first
-        for num in candidates:
-            if len(out) >= limit:
-                break
-            uid = num.decode(errors="replace")
-            if uid in seen_ids:
-                continue
-            typ, msg_data = conn.fetch(num, "(BODY.PEEK[])")
+        typ, data = conn.uid("search", "ALL")
+        mailbox_max = max(_uids(typ, data), default=0)
+        if since_uid is None:
+            return out, mailbox_max
+        since = int(since_uid)
+        typ, data = conn.uid("search", "UNSEEN")
+        fresh = [u for u in _uids(typ, data) if u > since][: max(limit, 1)]
+        for uid in fresh:
+            typ, msg_data = conn.uid("fetch", str(uid), "(BODY.PEEK[])")
             if typ != "OK" or not msg_data:
                 continue
             raw = next((p[1] for p in msg_data if isinstance(p, tuple)), None)
@@ -129,14 +151,14 @@ def fetch_new_emails(account: Dict[str, Any], seen_ids: Set[str],
             except Exception:
                 ts = 0.0
             out.append({
-                "uid": uid,
+                "uid": str(uid),
                 "from_name": from_name or from_addr,
                 "from_addr": from_addr.lower(),
                 "subject": (msg.get("Subject") or "").strip(),
                 "ts": ts,
                 "body": _decode_body(msg),
             })
-        return out
+        return out, (max(fresh) if fresh else since)
     finally:
         try:
             conn.logout()
