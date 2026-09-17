@@ -117,3 +117,20 @@ def test_inbox_is_selected_readonly(fake):
     conn = fake([1], [1])
     mailer.fetch_new_emails(ACCOUNT, None)
     assert conn.readonly is True
+
+
+def test_rewind_is_bounded_by_how_many_letters_were_asked(fake):
+    # 20k unread letters must never become 20k LLM calls, whatever `back` says.
+    fake(range(1, 20_001), list(range(1, 20_001)))
+    assert mailer.rewind_baseline(ACCOUNT, 20) == 19_980
+    assert mailer.rewind_baseline(ACCOUNT, 1000) == 19_900   # clamped to 100
+
+
+def test_rewind_with_fewer_unread_than_asked_takes_them_all(fake):
+    fake(range(1, 101), [10, 11, 12])
+    assert mailer.rewind_baseline(ACCOUNT, 20) == 9
+
+
+def test_rewind_on_a_mailbox_without_unread_returns_none(fake):
+    fake(range(1, 101), [])
+    assert mailer.rewind_baseline(ACCOUNT, 20) is None

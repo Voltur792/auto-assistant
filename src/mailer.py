@@ -166,6 +166,32 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
             pass
 
 
+def rewind_baseline(account: Dict[str, Any], back: int = 20) -> Optional[int]:
+    """A baseline that makes the newest `back` unread letters look new again.
+
+    The mail baseline sits at the end of the mailbox, so letters that were
+    already there when the plugin started are never reported — correct for an
+    install, but it leaves the tab empty after a fix or a "clear". This
+    returns the UID to rewind to so exactly the newest `back` unread letters
+    come back (bounded by design: a mailbox with 20k unread letters must not
+    turn into 20k LLM calls). None when the mailbox has no unread letters.
+    """
+    conn = _connect(account)
+    try:
+        conn.select("INBOX", readonly=True)
+        typ, data = conn.uid("search", "UNSEEN")
+        unseen = _uids(typ, data)
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    if not unseen:
+        return None
+    back = max(1, min(int(back), 100))
+    return unseen[0] - 1 if len(unseen) <= back else unseen[-back - 1]
+
+
 def test_account(account: Dict[str, Any]) -> str:
     """Login + INBOX status; returns a human-readable success line.
 

@@ -122,7 +122,11 @@ const IMP_LABEL = { high: 'Важно', normal: 'Обычное', low: 'Мень
 function renderDigest() {
     const box = $('digestList');
     if (!S.digest.length) {
-        box.innerHTML = `<div class="placeholder"><div class="big">✉️</div>Пока пусто. Добавь почтовый ящик во вкладке «Почта» — помощник разберёт новые письма.</div>`;
+        const hasAcct = (((S.settings || {}).accounts) || []).length;
+        const hint = hasAcct
+            ? 'Пока пусто. Сообщаю только о письмах, пришедших после первой проверки — нажми «⟲ Последние письма», чтобы разобрать то, что уже лежит непрочитанным.'
+            : 'Пока пусто. Добавь почтовый ящик во вкладке «Почта» — помощник разберёт новые письма.';
+        box.innerHTML = `<div class="placeholder"><div class="big">✉️</div>${hint}</div>`;
         return;
     }
     box.innerHTML = S.digest.map((it) => {
@@ -428,6 +432,20 @@ $('handoffBtn').onclick = async (e) => {
         else flash('Передано Астра ✓', true);
     } catch (err) { flash(String(err), false); }
     finally { e.target.disabled = false; e.target.textContent = old; }
+};
+
+$('rewindBtn').onclick = async (e) => {
+    const btn = e.target;
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Разбираю…';
+    try {
+        const r = await call('aa_rewind_baseline', { back: 20 });
+        if (r && r.error) flash(r.error, false);
+        else if (r && r.report) flash(r.report, true);
+        await refresh();
+    } catch (err) { flash(String(err), false); }
+    finally { btn.disabled = false; btn.textContent = old; }
 };
 
 $('clearDigestBtn').onclick = async () => { try { await call('aa_clear_digest'); await refresh(); } catch (e) {} };

@@ -669,6 +669,50 @@ class AstraAutoAssistant(Plugin):
                              "48 часов — задачи по ним уже запрошены у Астры"}
         return await self._handoff(items)
 
+    @ui_call("aa_rewind_baseline")
+    async def ui_rewind_baseline(self, **params: Any) -> Dict[str, Any]:
+        """Re-triage the newest `back` unread letters of every enabled account.
+
+        The mail baseline sits at the end of the mailbox (see
+        mailer.fetch_new_emails), which is right for an install but means mail
+        that predates the plugin is never mentioned. Rewinding is bounded, so a
+        mailbox with twenty thousand unread letters cannot become twenty
+        thousand LLM calls.
+        """
+        try:
+            back = int(params.get("back") or 20)
+        except (TypeError, ValueError):
+            back = 20
+        settings = store.load_settings()
+        state = store.load_state()
+        status = state.setdefault("acct_status", {})
+        moved: List[str] = []
+        errors: List[str] = []
+        for acct in settings.get("accounts") or []:
+            if not acct.get("enabled", True):
+                continue
+            if not (acct.get("email") and acct.get("password")):
+                continue
+            acct_id = acct.get("id") or acct.get("email")
+            try:
+                base = await asyncio.to_thread(mailer.rewind_baseline, acct, back)
+            except Exception as e:
+                errors.append(f"{acct.get('email')}: {str(e)[:200]}")
+                continue
+            if base is None:
+                continue
+            entry = dict(status.get(acct_id) or {})
+            entry["last_uid"] = int(base)
+            status[acct_id] = entry
+            moved.append(acct.get("email", ""))
+        if not moved:
+            note = f" Ошибки: {errors[0]}" if errors else ""
+            return {"error": "Нечего показывать — непрочитанных писем нет." + note}
+        store.save_state(state)
+        report = await self.poll_once(auto=False)
+        return {"success": True, "report": report, "accounts": moved,
+                "errors": errors}
+
     @ui_call("aa_clear_digest")
     async def ui_clear_digest(self, **params: Any) -> Dict[str, Any]:
         store.clear_digest()
