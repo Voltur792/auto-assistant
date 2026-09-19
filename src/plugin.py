@@ -402,25 +402,34 @@ class AstraAutoAssistant(Plugin):
     def _clean_handoff_answer(answer: str) -> str:
         """Make the model's reply readable in the tab.
 
-        A small model sometimes answers with tool-call JSON as TEXT —
-        parroting the prompt's call examples — instead of calling the tools
-        (seen in the wild: two {"arguments":…} lines as the whole reply).
-        Raw JSON in the tab is noise; the verification note appended after
-        it already says what actually happened. Code fences and pure-JSON
-        lines are replaced with one short marker, human text is kept.
+        A small model answers the handoff with whatever format it answered
+        the last prompts in: tool-call JSON as text (parroting old call
+        examples), or a TRIAGE LINE («1 | normal | … | … | …») learned
+        from the triage prompt in the same conversation — both seen in the
+        wild as the whole reply. Raw formats in the tab are noise; the
+        verification note appended after it already says what actually
+        happened. Code fences, pure-JSON lines and triage-shaped lines are
+        collapsed into short markers, human text is kept.
         """
         t = (answer or "").strip()
         lines = []
-        marker_seen = False
+        json_seen = False
+        triage_seen = False
         for ln in t.splitlines():
             s = ln.strip()
             if s.startswith("```"):        # code fence, drop the line
                 continue
             if s.startswith("{") and s.endswith("}"):
-                if not marker_seen:
+                if not json_seen:
                     lines.append("⟨ответила JSON-текстом вместо вызова "
                                  "инструментов⟩")
-                    marker_seen = True
+                    json_seen = True
+                continue
+            head = s.split("|", 1)[0].strip()
+            if head.isdigit() and s.count("|") >= 2:
+                if not triage_seen:
+                    lines.append("⟨ответила строкой разбора⟩")
+                    triage_seen = True
                 continue
             lines.append(ln)
         cleaned = "\n".join(lines).strip()
@@ -474,7 +483,15 @@ class AstraAutoAssistant(Plugin):
             note = (" (проверка: новых задач, напоминаний и записей в "
                     "календаре НЕ появилось — Астра ответила текстом, не "
                     "вызвав инструменты; нажми кнопку ещё раз)")
-        full = self._clean_handoff_answer(answer)[:2000] + note
+        clean = self._clean_handoff_answer(answer)
+        if verified and (not clean or "⟨" in clean):
+            # The reply was a parroted format (triage line / JSON), not a
+            # human sentence — but the counters say the tasks exist. The
+            # tab and the voice announcement get a synthesized readable
+            # message instead of the model's noise.
+            full = "Астра создала задачи по письмам." + note
+        else:
+            full = clean[:2000] + note
         self._save_handoff_result(True, "", full, items, verified)
         return {"success": True, "answer": full, "verified": verified}
 

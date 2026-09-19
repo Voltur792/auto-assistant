@@ -55,6 +55,65 @@ def test_clean_handoff_answer_replaces_parroted_tool_calls():
     assert AstraAutoAssistant._clean_handoff_answer(human) == human
 
 
+def test_clean_handoff_answer_replaces_triage_lines():
+    # After the triage switched to line format, the model answered the
+    # HANDOFF with a triage line («1 | normal | … | … | …») as its final
+    # text — the tab and the voice read it out. Triage-shaped lines are
+    # collapsed into a marker; human text around them survives.
+    raw = ("1 | normal | Запланировано собрание на 21 сентября 2026 года "
+           "в 17:00. | Подготовиться к собранию | 21.09.2026; 17:00")
+    cleaned = AstraAutoAssistant._clean_handoff_answer(raw)
+    assert "|" not in cleaned
+    assert "строкой разбора" in cleaned
+    mixed = "Готово.\n2 | high | Счёт | Оплатить | 20.09"
+    cleaned2 = AstraAutoAssistant._clean_handoff_answer(mixed)
+    assert "Готово." in cleaned2 and "|" not in cleaned2
+    # A sentence that merely contains a number and one pipe is NOT triage.
+    assert AstraAutoAssistant._clean_handoff_answer(
+        "Задача 3 | создана") == "Задача 3 | создана"
+
+
+def test_handoff_verified_with_tech_answer_gets_readable_message(
+        tmp_path, monkeypatch):
+    # Regression (19.09, real): the model created the task AND answered
+    # with a triage line as text — the tab showed the raw line. A verified
+    # handoff whose reply is a parroted format gets a synthesized readable
+    # message instead.
+    import asyncio
+
+    from src import store
+
+    monkeypatch.setattr(store, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(store, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(store, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(store, "_migrated", False)
+    store.save_settings(store.DEFAULT_SETTINGS)
+    store.add_digest_item({"id": "a1:10", "importance": "high"})
+
+    plugin = AstraAutoAssistant()
+    plugin.host = object()
+
+    async def fake_ask(prompt, voice=True):
+        return ("1 | normal | Запланировано собрание | "
+                "Подготовиться | 21.09.2026; 17:00")
+
+    counts = iter([[3, 0, 2], [4, 0, 3]])   # +1 task, +1 calendar event
+    monkeypatch.setattr(plugin, "_ask_astra", fake_ask)
+    monkeypatch.setattr(AstraAutoAssistant, "_astra_task_counts",
+                        staticmethod(lambda: next(counts)))
+
+    result = asyncio.run(plugin._handoff(
+        [{"account_id": "a1", "uid": "10", "from_name": "Я",
+          "subject": "собрание", "tasks": [], "reminders": []}]))
+    assert result["success"] is True and result["verified"] is True
+    assert "|" not in result["answer"]
+    assert "создала задачи" in result["answer"]
+    assert "создано задач 1" in result["answer"]
+    state = store.load_state()
+    assert state["digest"][0]["handled"] is True
+    assert "|" not in state["handoff_answer"]
+
+
 def test_handoff_empty_reply_with_created_tasks_is_success(tmp_path, monkeypatch):
     # Regression (19.09, real): the model called core:add_task and
     # core:add_calendar_event but answered with NO final text — the plugin
