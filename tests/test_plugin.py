@@ -35,6 +35,26 @@ def test_no_config_the_daemon_can_deliver_crashes_this_plugin():
             h.set_config(payload)
 
 
+def test_clean_handoff_answer_replaces_parroted_tool_calls():
+    # The model once answered the handoff with the prompt's call examples as
+    # TEXT (two {"arguments":…} lines) instead of calling the tools — the
+    # tab showed raw JSON. The cleaner keeps human text and collapses every
+    # pure-JSON line (and code fences) into one readable marker.
+    raw = ('{"arguments":{"text":"Собрание","date":"20.09.2026",'
+           '"time":"18:00"},"id":"core:add_calendar_event"}\n'
+           '{"arguments":{"text":"Подготовиться","id":"core:add_task"}')
+    cleaned = AstraAutoAssistant._clean_handoff_answer(raw)
+    assert '{"arguments"' not in cleaned
+    assert "JSON-текстом" in cleaned
+    # Fenced triage-style answers shrink to the marker too.
+    fenced = '```json\n{"items": []}\n```'
+    cleaned2 = AstraAutoAssistant._clean_handoff_answer(fenced)
+    assert "```" not in cleaned2 and "items" not in cleaned2
+    # A normal human reply passes through untouched.
+    human = "Создала задачу «Подготовить отчёт» и запись в календаре."
+    assert AstraAutoAssistant._clean_handoff_answer(human) == human
+
+
 def test_astra_task_counts_best_effort(tmp_path, monkeypatch):
     # Verification reads Astra's own tasks/reminders/calendar; a missing or
     # unreadable file means "skip verification", never an exception.

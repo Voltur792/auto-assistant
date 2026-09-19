@@ -298,8 +298,18 @@ def test_handoff_prompt_calendar_mode():
     assert "core:add_calendar_event" in prompt
     assert '"id":"core:add_calendar_event"}' in prompt
     assert '"date":"' in prompt          # ISO date parameter in the example
+    # The example date must be ISO (ГГГГ-ММ-ДД), matching calendar.json — a
+    # DD.MM.YYYY example taught the model a date the calendar rejects
+    # (seen in the wild: "date":"20.09.2026" copied straight from it).
+    import re as _re
+    m = _re.search(r'"date":"([^"]+)"', prompt)
+    assert m and _re.fullmatch(r"\d{4}-\d{2}-\d{2}", m.group(1))
     assert "не напоминания" in prompt
     assert "core:add_reminder" not in prompt
+    # Anti-parroting: the model once answered with the call examples as TEXT
+    # instead of calling the tools; the prompt must forbid that.
+    assert "ПРИМЕРЫ формата" in prompt
+    assert "JSON и фигурные скобки" in prompt
     prompt_both = analyze.build_handoff_prompt([], deadline_mode="both")
     assert "core:add_calendar_event" in prompt_both
     assert "core:add_reminder" in prompt_both

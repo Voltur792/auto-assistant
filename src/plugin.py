@@ -398,6 +398,34 @@ class AstraAutoAssistant(Plugin):
             counts.append(len(data) if isinstance(data, list) else 0)
         return counts
 
+    @staticmethod
+    def _clean_handoff_answer(answer: str) -> str:
+        """Make the model's reply readable in the tab.
+
+        A small model sometimes answers with tool-call JSON as TEXT —
+        parroting the prompt's call examples — instead of calling the tools
+        (seen in the wild: two {"arguments":…} lines as the whole reply).
+        Raw JSON in the tab is noise; the verification note appended after
+        it already says what actually happened. Code fences and pure-JSON
+        lines are replaced with one short marker, human text is kept.
+        """
+        t = (answer or "").strip()
+        lines = []
+        marker_seen = False
+        for ln in t.splitlines():
+            s = ln.strip()
+            if s.startswith("```"):        # code fence, drop the line
+                continue
+            if s.startswith("{") and s.endswith("}"):
+                if not marker_seen:
+                    lines.append("⟨ответила JSON-текстом вместо вызова "
+                                 "инструментов⟩")
+                    marker_seen = True
+                continue
+            lines.append(ln)
+        cleaned = "\n".join(lines).strip()
+        return cleaned or t
+
     async def _handoff(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Ask Astra to turn digest findings into real tasks/reminders.
 
@@ -437,7 +465,7 @@ class AstraAutoAssistant(Plugin):
                     " (проверка: новых задач, напоминаний и записей в "
                     "календаре НЕ появилось — Астра ответила текстом, не "
                     "вызвав инструменты; нажми кнопку ещё раз)")
-        full = answer[:2000] + note
+        full = self._clean_handoff_answer(answer)[:2000] + note
         self._save_handoff_result(True, "", full, items, verified)
         return {"success": True, "answer": full, "verified": verified}
 

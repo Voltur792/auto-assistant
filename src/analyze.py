@@ -150,9 +150,12 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
     ("tool_call: missing `id`"), or invents parameter names
     ("reminder_text"/"date" instead of "text"/"time")."""
     today = time.strftime("%d.%m.%Y")
-    tomorrow = time.strftime("%d.%m.%Y", time.localtime(time.time() + 86400))
+    today_iso = time.strftime("%Y-%m-%d")
+    tomorrow_iso = time.strftime("%Y-%m-%d",
+                                 time.localtime(time.time() + 86400))
     lines = [
-        f"Сегодня {today}. Создай задачи и напоминания по письмам ниже.",
+        f"Сегодня {today} (в формате ISO: {today_iso}). Создай задачи и "
+        "напоминания по письмам ниже.",
         "Инструменты и их параметры:",
         "— core:add_task: параметр text (текст задачи).",
     ]
@@ -165,7 +168,7 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
             "в arguments только параметры:",
             '{"arguments":{"text":"Подготовить отчёт"},"id":"core:add_task"}',
             '{"arguments":{"text":"Собрание — подготовить отчёт",'
-            f'"date":"{tomorrow}","time":"11:00"'
+            f'"date":"{tomorrow_iso}","time":"11:00"'
             '},"id":"core:add_calendar_event"}',
         ]
     elif deadline_mode == "both":
@@ -181,7 +184,7 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
             '{"arguments":{"text":"17.09 собрание — подготовить отчёт",'
             '"time":"11:00"},"id":"core:add_reminder"}',
             '{"arguments":{"text":"Собрание — подготовить отчёт",'
-            f'"date":"{tomorrow}","time":"11:00"'
+            f'"date":"{tomorrow_iso}","time":"11:00"'
             '},"id":"core:add_calendar_event"}',
         ]
     else:  # reminders
@@ -195,6 +198,8 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
             '"time":"11:00"},"id":"core:add_reminder"}',
         ]
     lines += [
+        "Строки в фигурных скобках выше — ПРИМЕРЫ формата ВЫЗОВА, не текст "
+        "для ответа. Не копируй их в ответ.",
         "Если вызов не прошёл из-за схемы аргументов — повтори вызов с "
         "аргументами строго по прикреплённой схеме.",
         "Если инструментов нет в списке — сначала найди их поиском "
@@ -203,6 +208,8 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
         "письма (что сделать, к какому сроку).",
         "НЕ отвечай «создала» текстом без вызова инструментов. Если не "
         "получилось — честно напиши, что не смогла, и почему.",
+        "Ответ пиши обычным текстом (что сделала). JSON и фигурные скобки "
+        "в ответе запрещены.",
     ]
     for it in items:
         lines.append(f"— От {it.get('from_name') or it.get('from_addr')}: "
