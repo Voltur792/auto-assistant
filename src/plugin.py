@@ -447,10 +447,11 @@ class AstraAutoAssistant(Plugin):
         answer = await self._ask_astra(
             analyze.build_handoff_prompt(items, deadline_mode=mode),
             voice=voice)
-        if not answer:
-            reason = self._llm_error or "Astra не ответила (пустой ответ)"
-            self._save_handoff_result(False, reason, "", items, None)
-            return {"success": False, "error": reason}
+        # Verify FIRST, against Astra's own task files: the model may call
+        # the tools and then answer with NO final text (seen in the wild:
+        # add_task + add_calendar_event executed, empty reply) — an empty
+        # reply with grown counters is a SUCCESS, not a failure. The
+        # counters outrank both the reply text and its absence.
         note = ""
         verified: Optional[bool] = None
         after = self._astra_task_counts()
@@ -460,9 +461,17 @@ class AstraAutoAssistant(Plugin):
             d_cal = after[2] - before[2]
             verified = (d_tasks + d_rems + d_cal) > 0
             note = (f" (проверка: создано задач {d_tasks}, напоминаний "
-                    f"{d_rems}, записей в календаре {d_cal})"
-                    if verified else
-                    " (проверка: новых задач, напоминаний и записей в "
+                    f"{d_rems}, записей в календаре {d_cal})")
+        if not answer:
+            if verified:
+                full = ("Астра создала задачи, не ответив текстом." + note)
+                self._save_handoff_result(True, "", full, items, True)
+                return {"success": True, "answer": full, "verified": True}
+            reason = self._llm_error or "Astra не ответила (пустой ответ)"
+            self._save_handoff_result(False, reason, "", items, None)
+            return {"success": False, "error": reason}
+        if not verified and before is not None and after is not None:
+            note = (" (проверка: новых задач, напоминаний и записей в "
                     "календаре НЕ появилось — Астра ответила текстом, не "
                     "вызвав инструменты; нажми кнопку ещё раз)")
         full = self._clean_handoff_answer(answer)[:2000] + note
