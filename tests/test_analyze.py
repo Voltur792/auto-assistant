@@ -263,6 +263,31 @@ def test_handoff_prompt_names_core_tools():
     assert "до 18:00" in prompt
 
 
+def test_handoff_prompt_carries_the_letter_text_when_no_tasks_were_extracted():
+    # Regression (19.09, real): a high letter with tasks: [] went to the
+    # handoff as a bare "— От Фотин Максим:" (empty subject, no body) — the
+    # model had literally nothing to create and honestly answered
+    # {"items": []}. The prompt must carry the letter's body (or summary)
+    # and tell the model to formulate tasks itself.
+    prompt = analyze.build_handoff_prompt(
+        [{"from_name": "Фотин Максим", "subject": "", "body": "завтра собрание",
+          "summary": "сообщение о собрании", "tasks": [], "reminders": []}])
+    assert "завтра собрание" in prompt
+    assert "сформулируй их сам" in prompt
+    # A letter WITH extracted tasks needs no body dump — the tasks are the
+    # instruction; only the summary line stays out of the way.
+    prompt2 = analyze.build_handoff_prompt(
+        [{"from_name": "Иван", "subject": "Отчёт", "body": "текст письма",
+          "tasks": ["Сдать отчёт"], "reminders": []}])
+    assert "текст письма" not in prompt2
+    assert "Сдать отчёт" in prompt2
+    # No body and no tasks — the summary is the fallback.
+    prompt3 = analyze.build_handoff_prompt(
+        [{"from_name": "Иван", "subject": "Счёт", "summary": "оплата до 20.09",
+          "tasks": [], "reminders": []}])
+    assert "оплата до 20.09" in prompt3
+
+
 def test_handoff_prompt_calendar_mode():
     # calendar.json holds {date, text, time}; the calendar mode must use
     # core:add_calendar_event with an ISO date example and no reminders.

@@ -121,6 +121,8 @@ def build_llm_prompt(items: List[Dict[str, Any]]) -> str:
         "бездействие ухудшит ситуацию. low: реклама, рассылки.",
         "tasks — конкретные действия (максимум 3 на письмо), reminders — "
         "только если в письме есть дата/срок (иначе []).",
+        "Для каждого письма с importance=high обязательно предложи хотя бы "
+        "одну задачу — что сделать по этому письму.",
         "Письма:",
     ]
     for i, it in enumerate(items, 1):
@@ -197,6 +199,8 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
         "аргументами строго по прикреплённой схеме.",
         "Если инструментов нет в списке — сначала найди их поиском "
         "инструментов (запрос: add_task), потом вызови найденный.",
+        "Если по письму нет готовых задач — сформулируй их сам по тексту "
+        "письма (что сделать, к какому сроку).",
         "НЕ отвечай «создала» текстом без вызова инструментов. Если не "
         "получилось — честно напиши, что не смогла, и почему.",
     ]
@@ -207,6 +211,18 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
             lines.append(f"    задача: {t}")
         for r in it.get("reminders") or []:
             lines.append(f"    срок: {r}")
+        # A high letter can arrive with NO extracted tasks (own-mail and
+        # rule overrides set high over a verdict that found nothing, and a
+        # small model often returns tasks: []). Without the letter's own
+        # text the model saw an empty bullet list and honestly answered
+        # {"items": []} — nothing to create. Give it the summary, and the
+        # body when there are no ready-made tasks.
+        if not (it.get("tasks") or it.get("reminders")):
+            body = (it.get("body") or "").strip()
+            if body:
+                lines.append(f"    текст письма: {body[:400]}")
+            elif it.get("summary"):
+                lines.append(f"    суть письма: {it['summary']}")
     return "\n".join(lines)
 
 
