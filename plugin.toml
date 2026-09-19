@@ -1,7 +1,7 @@
 [plugin]
 id = "auto-assistant"
 name = "Auto Assistant"
-version = "0.1.1"
+version = "0.2.0"
 description = "Automatic assistant: reads mail (Yandex/Gmail over IMAP), triages it with an allow-list or Astra's own LLM, builds a digest with tasks and reminders, and fires a trigger your automations can react to."
 author = "Voltur"
 license = "MIT"
