@@ -81,6 +81,36 @@ def test_parse_llm_answer_plain_and_chatty():
     assert analyze.parse_llm_answer("") is None
 
 
+def test_parse_llm_answer_line_format():
+    # The triage prompt now asks for pipe-separated LINES (JSON replies in
+    # the plugin conversation taught the model to answer the handoff with
+    # tool-call JSON as text). Non-matching lines are skipped.
+    reply = ("Вот разбор:\n"
+             "1 | high | Счёт, оплатить до 20.09 | Оплатить счёт; Проверить сумму | 20.09\n"
+             "2 | low | Рассылка магазина | - | -\n"
+             "болтовня мимо формата")
+    parsed = analyze.parse_llm_answer(reply)
+    assert parsed[0]["importance"] == "high"
+    assert parsed[0]["tasks"] == ["Оплатить счёт", "Проверить сумму"]
+    assert parsed[0]["reminders"] == ["20.09"]
+    assert parsed[1]["importance"] == "low"
+    assert parsed[1]["tasks"] == [] and parsed[1]["reminders"] == []
+    # Russian importance synonyms are understood.
+    ru = "1 | важное | Собрание | Подготовиться | завтра 15:00"
+    assert analyze.parse_llm_answer(ru)[0]["importance"] == "high"
+    assert analyze.parse_llm_answer(ru)[0]["reminders"] == ["завтра 15:00"]
+
+
+def test_llm_prompt_asks_for_lines_not_json():
+    prompt = analyze.build_llm_prompt(
+        [{"from_name": "Иван", "from_addr": "i@x.ru", "subject": "Счёт",
+          "body": "оплатить счёт"}])
+    assert "номер | важность" in prompt
+    assert "без JSON" in prompt
+    assert "{" not in prompt and "}" not in prompt
+    assert "Счёт" in prompt
+
+
 def test_parse_llm_answer_sanitizes():
     bad = '{"items": [{"n": "x", "importance": "MEGA", "summary": 42, "tasks": "одна задача", "reminders": null}]}'
     parsed = analyze.parse_llm_answer(bad)
@@ -236,31 +266,30 @@ def test_acct_status_roundtrip(store_env):
 
 
 def test_handoff_prompt_names_core_tools():
-    # In the plugin conversation core task tools are deferred by tool-search
-    # compaction; without the exact ids the model answers "created" without
-    # calling anything (seen in the daemon log). Observed failure modes the
-    # prompt must guard against: tool id inside arguments ("missing id"),
-    # invented params ("reminder_text"/"date" instead of "text"/"time").
+    # The prompt must name the exact core tool ids and their real parameter
+    # names (from successful calls in the daemon log: add_task(text),
+    # add_reminder(text, time)) — a small model behind tool-search
+    # compaction never sees these tools in its list and needs to be told.
     prompt = analyze.build_handoff_prompt(
         [{"from_name": "Иван", "subject": "Отчёт",
           "tasks": ["Сдать отчёт"], "reminders": ["до 18:00"]}],
         deadline_mode="reminders")
     assert "core:add_task" in prompt
     assert "core:add_reminder" in prompt
-    # Correct parameter names (from real successful calls in the daemon log).
-    assert '"text"' in prompt
-    assert '"time"' in prompt
-    assert "reminder_text" not in prompt
-    # Call examples in the exact JSON shape: id on the TOP level.
-    assert '{"arguments":{"text"' in prompt
-    assert '"id":"core:add_task"}' in prompt
-    assert '"id":"core:add_reminder"}' in prompt
-    # Today's date so the model does not guess "tomorrow".
+    assert "reminder_text" not in prompt          # no invented params
+    # Direct per-letter call instructions with the real parameter name.
+    assert "text: Сдать отчёт" in prompt
+    # Today in both formats so the model does not guess the date.
     import time as _time
     assert _time.strftime("%d.%m.%Y") in prompt
+    assert _time.strftime("%Y-%m-%d") in prompt
     assert "Отчёт" in prompt
     assert "Сдать отчёт" in prompt
     assert "до 18:00" in prompt
+    # NO JSON call examples: the model parroted them as a text answer
+    # instead of calling the tools (seen twice in the wild).
+    assert "{" not in prompt and "}" not in prompt
+    assert "arguments" not in prompt
 
 
 def test_handoff_prompt_carries_the_letter_text_when_no_tasks_were_extracted():
@@ -273,14 +302,14 @@ def test_handoff_prompt_carries_the_letter_text_when_no_tasks_were_extracted():
         [{"from_name": "Фотин Максим", "subject": "", "body": "завтра собрание",
           "summary": "сообщение о собрании", "tasks": [], "reminders": []}])
     assert "завтра собрание" in prompt
-    assert "сформулируй их сам" in prompt
+    assert "сформулируй задачи сам" in prompt
     # A letter WITH extracted tasks needs no body dump — the tasks are the
     # instruction; only the summary line stays out of the way.
     prompt2 = analyze.build_handoff_prompt(
         [{"from_name": "Иван", "subject": "Отчёт", "body": "текст письма",
           "tasks": ["Сдать отчёт"], "reminders": []}])
     assert "текст письма" not in prompt2
-    assert "Сдать отчёт" in prompt2
+    assert "text: Сдать отчёт" in prompt2
     # No body and no tasks — the summary is the fallback.
     prompt3 = analyze.build_handoff_prompt(
         [{"from_name": "Иван", "subject": "Счёт", "summary": "оплата до 20.09",
@@ -289,27 +318,18 @@ def test_handoff_prompt_carries_the_letter_text_when_no_tasks_were_extracted():
 
 
 def test_handoff_prompt_calendar_mode():
-    # calendar.json holds {date, text, time}; the calendar mode must use
-    # core:add_calendar_event with an ISO date example and no reminders.
+    # calendar.json holds {date, text, time}; the calendar mode must name
+    # core:add_calendar_event with an ISO date and no reminders.
     prompt = analyze.build_handoff_prompt(
         [{"from_name": "Иван", "subject": "Собрание",
           "tasks": ["Отчёт"], "reminders": ["завтра в 11:00 собрание"]}],
         deadline_mode="calendar")
     assert "core:add_calendar_event" in prompt
-    assert '"id":"core:add_calendar_event"}' in prompt
-    assert '"date":"' in prompt          # ISO date parameter in the example
-    # The example date must be ISO (ГГГГ-ММ-ДД), matching calendar.json — a
-    # DD.MM.YYYY example taught the model a date the calendar rejects
-    # (seen in the wild: "date":"20.09.2026" copied straight from it).
-    import re as _re
-    m = _re.search(r'"date":"([^"]+)"', prompt)
-    assert m and _re.fullmatch(r"\d{4}-\d{2}-\d{2}", m.group(1))
-    assert "не напоминания" in prompt
     assert "core:add_reminder" not in prompt
-    # Anti-parroting: the model once answered with the call examples as TEXT
-    # instead of calling the tools; the prompt must forbid that.
-    assert "ПРИМЕРЫ формата" in prompt
-    assert "JSON и фигурные скобки" in prompt
+    assert "запись в календаре" in prompt
+    assert "ГГГГ-ММ-ДД" in prompt               # ISO date format spelled out
+    assert "{" not in prompt                     # no JSON to parrot
+    assert "разобрав дату и время" in prompt
     prompt_both = analyze.build_handoff_prompt([], deadline_mode="both")
     assert "core:add_calendar_event" in prompt_both
     assert "core:add_reminder" in prompt_both

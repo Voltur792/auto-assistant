@@ -106,23 +106,28 @@ def is_own_mail(from_addr: str, accounts: Any) -> bool:
 
 
 def build_llm_prompt(items: List[Dict[str, Any]]) -> str:
-    """Prompt asking Astra's assistant to triage messages and reply JSON only.
+    """Prompt asking Astra's assistant to triage messages, one line each.
 
-    Astra's chat model is not a strict JSON endpoint, so the instruction is
-    blunt and parse_llm_answer() is forgiving.
+    The reply format is plain pipe-separated LINES, not JSON. Why: every
+    JSON reply in this plugin's conversation teaches the model that
+    "messages from this plugin get JSON answers" — and it then answers the
+    HANDOFF prompt with tool-call JSON as text instead of calling the
+    tools (observed in the wild: {"arguments":…} parroted as the reply).
+    parse_llm_answer() still accepts JSON as a fallback for chatty models.
     """
     lines = [
-        "Разберёшь новые письма как ассистент. Ответь ТОЛЬКО валидным JSON, "
-        "без пояснений и без markdown.",
-        "Формат: {\"items\": [{\"n\": <номер>, \"importance\": "
-        "\"high|normal|low\", \"summary\": \"1-2 предложения по-русски\", "
-        "\"tasks\": [\"дело\"], \"reminders\": [\"когда и что\"]}]}",
-        "importance=high: оплата, счета, сроки, документы, безопасность, "
-        "бездействие ухудшит ситуацию. low: реклама, рассылки.",
-        "tasks — конкретные действия (максимум 3 на письмо), reminders — "
-        "только если в письме есть дата/срок (иначе []).",
-        "Для каждого письма с importance=high обязательно предложи хотя бы "
-        "одну задачу — что сделать по этому письму.",
+        "Разберёшь новые письма. Ответь по ОДНОЙ строке на письмо, поля "
+        "через «|», без JSON и без пояснений:",
+        "номер | важность | сводка | задачи | сроки",
+        "важность: high (оплата, счета, сроки, документы, безопасность, "
+        "бездействие ухудшит ситуацию), normal, low (реклама, рассылки).",
+        "сводка: 1-2 предложения по-русски.",
+        "задачи: конкретные действия через «;» (максимум 3), «-» если нет. "
+        "Для high обязательно предложи хотя бы одну задачу.",
+        "сроки: даты и время из письма через «;», «-» если нет.",
+        "Пример:",
+        "1 | high | Счёт за электричество, оплатить до 20.09 | Оплатить счёт | 20.09",
+        "2 | low | Рассылка магазина об акциях | - | -",
         "Письма:",
     ]
     for i, it in enumerate(items, 1):
@@ -142,101 +147,125 @@ def build_handoff_prompt(items: List[Dict[str, Any]],
                          deadline_mode: str = "calendar") -> str:
     """Prompt asking Astra to create real tasks/reminders from digest items.
 
-    Names the exact core tools AND their parameters, with call examples in
-    the exact JSON shape Astra parses. Why so specific: in the plugin
-    conversation the tools sit behind tool-search compaction, and a small
-    local model without exact ids/params fails in observed ways — answers
-    "created" without calling anything, puts the tool id INSIDE arguments
-    ("tool_call: missing `id`"), or invents parameter names
-    ("reminder_text"/"date" instead of "text"/"time")."""
+    Strictly imperative, with NO JSON call examples. Why: in the plugin's
+    conversation the tools sit behind tool-search compaction and the model
+    never sees core:add_task in its visible list — so it needs to be TOLD
+    to call the tools by id directly. And every JSON-shaped thing in the
+    prompt (or in the conversation's history — the triage used to ask for
+    JSON) gets parroted back as a text answer instead of a tool call
+    (observed twice in the wild). Astra dispatches a call by id even for a
+    deferred tool, so naming the ids is enough.
+    """
     today = time.strftime("%d.%m.%Y")
     today_iso = time.strftime("%Y-%m-%d")
-    tomorrow_iso = time.strftime("%Y-%m-%d",
-                                 time.localtime(time.time() + 86400))
     lines = [
-        f"Сегодня {today} (в формате ISO: {today_iso}). Создай задачи и "
-        "напоминания по письмам ниже.",
-        "Инструменты и их параметры:",
-        "— core:add_task: параметр text (текст задачи).",
+        f"Сегодня {today} (в формате ISO: {today_iso}).",
+        "По письмам ниже создай задачи, ВЫЗВАВ инструменты (не текстом):",
+        "— core:add_task — параметр text: текст задачи.",
     ]
     if deadline_mode == "calendar":
         lines += [
-            "— core:add_calendar_event: запись в календаре. Параметры text "
-            "(текст), date (\"ГГГГ-ММ-ДД\") и time (\"ЧЧ:ММ\"). Для сроков "
-            "используй только его, не напоминания.",
-            "Вызывай ровно в таком формате — id инструмента ОТДЕЛЬНЫМ полем id, "
-            "в arguments только параметры:",
-            '{"arguments":{"text":"Подготовить отчёт"},"id":"core:add_task"}',
-            '{"arguments":{"text":"Собрание — подготовить отчёт",'
-            f'"date":"{tomorrow_iso}","time":"11:00"'
-            '},"id":"core:add_calendar_event"}',
+            "— core:add_calendar_event — параметры text, date (ГГГГ-ММ-ДД), "
+            "time (ЧЧ:ММ). Каждый срок из письма — запись в календаре.",
         ]
     elif deadline_mode == "both":
         lines += [
-            "— core:add_reminder: параметры text (текст) и time (\"ЧЧ:ММ\"). "
-            "Дату пиши в text, отдельного параметра даты нет.",
-            "— core:add_calendar_event: запись в календаре. Параметры text, "
-            "date (\"ГГГГ-ММ-ДД\") и time (\"ЧЧ:ММ\"). Для каждого срока "
-            "создай И напоминание, И запись в календаре.",
-            "Вызывай ровно в таком формате — id инструмента ОТДЕЛЬНЫМ полем id, "
-            "в arguments только параметры:",
-            '{"arguments":{"text":"Подготовить отчёт"},"id":"core:add_task"}',
-            '{"arguments":{"text":"17.09 собрание — подготовить отчёт",'
-            '"time":"11:00"},"id":"core:add_reminder"}',
-            '{"arguments":{"text":"Собрание — подготовить отчёт",'
-            f'"date":"{tomorrow_iso}","time":"11:00"'
-            '},"id":"core:add_calendar_event"}',
+            "— core:add_reminder — параметры text (дату пиши в text), "
+            "time (ЧЧ:ММ).",
+            "— core:add_calendar_event — параметры text, date (ГГГГ-ММ-ДД), "
+            "time (ЧЧ:ММ). Каждый срок — И напоминание, И запись в календаре.",
         ]
     else:  # reminders
         lines += [
-            "— core:add_reminder: параметры text (текст) и time (\"ЧЧ:ММ\"). "
-            "Дату пиши в text, отдельного параметра даты нет.",
-            "Вызывай ровно в таком формате — id инструмента ОТДЕЛЬНЫМ полем id, "
-            "в arguments только параметры:",
-            '{"arguments":{"text":"Подготовить отчёт"},"id":"core:add_task"}',
-            '{"arguments":{"text":"17.09 собрание — подготовить отчёт",'
-            '"time":"11:00"},"id":"core:add_reminder"}',
+            "— core:add_reminder — параметры text (дату пиши в text), "
+            "time (ЧЧ:ММ).",
         ]
     lines += [
-        "Строки в фигурных скобках выше — ПРИМЕРЫ формата ВЫЗОВА, не текст "
-        "для ответа. Не копируй их в ответ.",
-        "Если вызов не прошёл из-за схемы аргументов — повтори вызов с "
-        "аргументами строго по прикреплённой схеме.",
-        "Если инструментов нет в списке — сначала найди их поиском "
-        "инструментов (запрос: add_task), потом вызови найденный.",
-        "Если по письму нет готовых задач — сформулируй их сам по тексту "
-        "письма (что сделать, к какому сроку).",
-        "НЕ отвечай «создала» текстом без вызова инструментов. Если не "
-        "получилось — честно напиши, что не смогла, и почему.",
-        "Ответ пиши обычным текстом (что сделала). JSON и фигурные скобки "
-        "в ответе запрещены.",
+        "Эти инструменты доступны всегда — вызывай их напрямую по id, даже "
+        "если их нет в твоём списке инструментов.",
+        "Если вызов отвергнут из-за схемы аргументов — повтори вызов строго "
+        "по прикреплённой схеме.",
+        "Текстом не отвечай, JSON не пиши — только вызови инструменты.",
     ]
     for it in items:
-        lines.append(f"— От {it.get('from_name') or it.get('from_addr')}: "
-                     f"{it.get('subject')}")
+        lines.append(f"Письмо от {it.get('from_name') or it.get('from_addr')}: "
+                     f"{it.get('subject') or '(без темы)'}")
         for t in it.get("tasks") or []:
-            lines.append(f"    задача: {t}")
+            lines.append(f"  вызови core:add_task, text: {t}")
         for r in it.get("reminders") or []:
-            lines.append(f"    срок: {r}")
+            if deadline_mode == "calendar":
+                lines.append(f"  срок «{r}» — вызови core:add_calendar_event, "
+                             "разобрав дату и время")
+            elif deadline_mode == "both":
+                lines.append(f"  срок «{r}» — вызови core:add_reminder и "
+                             "core:add_calendar_event, разобрав дату и время")
+            else:
+                lines.append(f"  срок «{r}» — вызови core:add_reminder, "
+                             "разобрав дату и время")
         # A high letter can arrive with NO extracted tasks (own-mail and
         # rule overrides set high over a verdict that found nothing, and a
-        # small model often returns tasks: []). Without the letter's own
-        # text the model saw an empty bullet list and honestly answered
-        # {"items": []} — nothing to create. Give it the summary, and the
-        # body when there are no ready-made tasks.
+        # small model often returns no tasks). Without the letter's own
+        # text the model had nothing to create from and honestly answered
+        # that there is nothing to do. Give it the body, or the summary.
         if not (it.get("tasks") or it.get("reminders")):
             body = (it.get("body") or "").strip()
             if body:
-                lines.append(f"    текст письма: {body[:400]}")
+                lines.append(f"  текст письма: {body[:400]}")
             elif it.get("summary"):
-                lines.append(f"    суть письма: {it['summary']}")
+                lines.append(f"  суть письма: {it['summary']}")
+            extra = (" и core:add_calendar_event для сроков"
+                     if deadline_mode != "reminders" else "")
+            lines.append(f"  сформулируй задачи сам и вызови core:add_task "
+                         f"для каждой{extra}")
     return "\n".join(lines)
 
 
+_IMP_SYNONYMS = {
+    "high": "high", "высокая": "high", "высокое": "high", "важное": "high",
+    "важная": "high", "срочно": "high",
+    "normal": "normal", "обычное": "normal", "обычная": "normal",
+    "среднее": "normal",
+    "low": "low", "низкое": "low", "низкая": "low",
+}
+
+
+def _split_field(s: str) -> List[str]:
+    """Split a «;»-joined prompt field; «-» means empty."""
+    return [x.strip() for x in s.split(";")
+            if x.strip() and x.strip() != "-"]
+
+
+def _parse_line_answer(text: str) -> Optional[List[Dict[str, Any]]]:
+    """Parse the line-format triage reply: «n | importance | summary |
+    tasks | deadlines». Lines that do not match the shape are skipped, so
+    chatty preambles and examples quoted back do no harm."""
+    items: List[Dict[str, Any]] = []
+    for ln in text.splitlines():
+        parts = [p.strip() for p in ln.split("|")]
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        imp = _IMP_SYNONYMS.get(parts[1].casefold())
+        if imp is None:
+            continue
+        items.append({
+            "n": int(parts[0]),
+            "importance": imp,
+            "summary": parts[2][:400],
+            "tasks": _split_field(parts[3]) if len(parts) > 3 else [],
+            "reminders": _split_field(parts[4]) if len(parts) > 4 else [],
+        })
+    return items or None
+
+
 def parse_llm_answer(text: str) -> Optional[List[Dict[str, Any]]]:
-    """Extract the {"items": [...]} object from a chatty model reply."""
+    """Parse the model's triage reply: line format first, JSON as a
+    fallback (older prompts asked for JSON; a chatty model may still
+    produce it)."""
     if not text:
         return None
+    parsed = _parse_line_answer(text)
+    if parsed:
+        return parsed
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end <= start:
