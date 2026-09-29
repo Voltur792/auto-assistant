@@ -130,13 +130,19 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
     conn = _connect(account)
     out: List[Dict[str, Any]] = []
     try:
-        conn.select("INBOX", readonly=True)
+        typ, _ = conn.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise ConnectionError("Не удалось открыть папку INBOX")
         typ, data = conn.uid("search", "ALL")
+        if typ != "OK":
+            raise ConnectionError("Не удалось получить список писем INBOX")
         mailbox_max = max(_uids(typ, data), default=0)
         if since_uid is None:
             return out, mailbox_max
         since = int(since_uid)
         typ, data = conn.uid("search", "UNSEEN")
+        if typ != "OK":
+            raise ConnectionError("Не удалось получить непрочитанные письма")
         fresh = [u for u in _uids(typ, data) if u > since][: max(limit, 1)]
         for uid in fresh:
             msg = None
@@ -173,7 +179,7 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
                 "ts": ts,
                 "body": _decode_body(msg),
             })
-        return out, (max(int(m["uid"]) for m in out) if out else since)
+        return out, max(fresh, default=since)
     finally:
         try:
             conn.logout()

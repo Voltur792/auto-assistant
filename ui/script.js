@@ -79,6 +79,7 @@ function renderStatus() {
     const pill = $('statusPill');
     const st = S.status || {};
     const s = S.settings || {};
+    pill.removeAttribute('title');
     if (!s.enabled) {
         pill.className = 'status idle';
         pill.textContent = 'Пауза';
@@ -156,11 +157,13 @@ function renderHandoffNote() {
     if (st.handoff_error) {
         el.hidden = false;
         el.className = 'message error';
-        el.textContent = 'Создание задач не удалось: ' + st.handoff_error;
+        el.textContent = 'Создание задач не подтверждено: ' + st.handoff_error +
+            (st.handoff_answer ? ' Ответ Астры: ' +
+                st.handoff_answer.replace(/\s+/g, ' ').slice(0, 240) : '');
     } else if (st.handoff_answer) {
         el.hidden = false;
         el.className = 'message success';
-        el.textContent = 'Астра ответила: ' + st.handoff_answer.replace(/\s+/g, ' ').slice(0, 300);
+        el.textContent = st.handoff_answer.replace(/\s+/g, ' ').slice(0, 300);
     } else {
         el.hidden = true;
     }
@@ -430,6 +433,7 @@ $('handoffBtn').onclick = async (e) => {
         if (r && r.error) flash(r.error, false);
         else if (r && r.answer) flash('Передано Астра: ' + r.answer.slice(0, 160), true);
         else flash('Передано Астра ✓', true);
+        await refresh();
     } catch (err) { flash(String(err), false); }
     finally { e.target.disabled = false; e.target.textContent = old; }
 };
@@ -493,4 +497,10 @@ refresh().catch((e) => {
     $('statusPill').textContent = 'Бэкенд недоступен';
     $('digestList').innerHTML = `<div class="placeholder error">${esc(String(e))}</div>`;
 });
+call('aa_get_icon').then((result) => {
+    if (result && result.data_uri) {
+        $('brandIcon').src = result.data_uri;
+        $('brandIcon').hidden = false;
+    }
+}).catch(() => {});
 setInterval(() => { refresh().catch(() => {}); }, 30000);

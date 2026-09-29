@@ -148,6 +148,8 @@ def _ensure_migrated() -> None:
     if _migrated:
         return
     _migrated = True
+    if os.environ.get("AA_DATA_DIR"):
+        return  # An explicit isolated directory must never import real passwords.
     try:
         if SETTINGS_FILE.exists() or STATE_FILE.exists():
             return  # stable dir already has data — it wins

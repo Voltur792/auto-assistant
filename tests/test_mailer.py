@@ -203,3 +203,30 @@ def test_html_style_and_script_do_not_leak_into_the_body(monkeypatch):
     monkeypatch.setattr(mailer, "_connect", lambda account: conn)
     msgs, _ = mailer.fetch_new_emails(ACCOUNT, 0, limit=5)
     assert msgs[0]["body"] == "Настоящий текст письма"
+
+
+def test_poison_letter_at_limit_one_does_not_block_later_mail(monkeypatch):
+    class PoisonIMAP(FakeIMAP):
+        def uid(self, command, *args):
+            if command == "fetch" and args[0] == "101":
+                raise OSError("unreadable letter")
+            return super().uid(command, *args)
+
+    conn = PoisonIMAP([101, 102], [101, 102])
+    monkeypatch.setattr(mailer, "_connect", lambda account: conn)
+    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=1)
+    assert msgs == [] and high == 101
+    msgs, high = mailer.fetch_new_emails(ACCOUNT, high, limit=1)
+    assert [m["uid"] for m in msgs] == ["102"] and high == 102
+
+
+def test_failed_search_is_not_treated_as_an_empty_mailbox(monkeypatch):
+    class BrokenIMAP(FakeIMAP):
+        def uid(self, command, *args):
+            if command == "search":
+                return "NO", [b"server failure"]
+            return super().uid(command, *args)
+
+    monkeypatch.setattr(mailer, "_connect", lambda account: BrokenIMAP([], []))
+    with pytest.raises(ConnectionError):
+        mailer.fetch_new_emails(ACCOUNT, None)

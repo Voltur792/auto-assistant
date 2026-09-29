@@ -154,6 +154,7 @@ def test_merge_llm_partial_batch_prefiltered_ads():
 
 @pytest.fixture()
 def store_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("AA_DATA_DIR", raising=False)
     monkeypatch.setattr(store, "DATA_DIR", tmp_path)
     monkeypatch.setattr(store, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(store, "STATE_FILE", tmp_path / "state.json")
@@ -166,6 +167,14 @@ def store_env(tmp_path, monkeypatch):
 def test_data_dir_env_override(store_env, monkeypatch):
     monkeypatch.setenv("AA_DATA_DIR", str(store_env / "envdir"))
     assert store._default_data_dir() == store_env / "envdir"
+
+
+def test_explicit_data_dir_does_not_import_legacy_passwords(store_env, monkeypatch):
+    monkeypatch.setenv("AA_DATA_DIR", str(store_env))
+    store._LEGACY_DATA_DIR.mkdir()
+    (store._LEGACY_DATA_DIR / "settings.json").write_text(
+        '{"accounts": [{"password": "private"}]}', encoding="utf-8")
+    assert store.load_settings()["accounts"] == []
 
 
 def test_migrates_legacy_settings_once(store_env):

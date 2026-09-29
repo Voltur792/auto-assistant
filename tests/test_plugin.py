@@ -20,6 +20,26 @@ from astra_plugin_sdk.testing import Harness, fuzz_configs  # noqa: E402
 
 from src.plugin import AstraAutoAssistant  # noqa: E402
 
+
+def test_astra_chat_error_chunk_remains_visible():
+    import asyncio
+
+    class Chunk:
+        def WhichOneof(self, _name):
+            return "error"
+
+        error = "модель недоступна"
+
+    class Host:
+        async def send_chat_message(self, _prompt, *, voice_enabled):
+            assert voice_enabled is True
+            yield Chunk()
+
+    plugin = AstraAutoAssistant()
+    plugin.host = Host()
+    assert asyncio.run(plugin._ask_astra("проверка", voice=True)) == ""
+    assert plugin._llm_error == "модель недоступна"
+
 def test_the_plugin_starts_and_answers_a_health_check():
     with Harness(AstraAutoAssistant()) as h:
         healthy, _status = h.health()
@@ -190,6 +210,43 @@ def test_handoff_empty_reply_without_creation_is_failure(tmp_path, monkeypatch):
     assert "handled" not in state["digest"][0]
 
 
+def test_handoff_text_reply_without_creation_is_failure(tmp_path, monkeypatch):
+    """A polite model response is not proof that it created anything."""
+    import asyncio
+
+    from src import store
+
+    monkeypatch.setattr(store, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(store, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(store, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(store, "_migrated", False)
+    store.save_settings(store.DEFAULT_SETTINGS)
+    store.add_digest_item({"id": "a1:11", "importance": "high"})
+
+    plugin = AstraAutoAssistant()
+    plugin.host = object()
+
+    async def fake_ask(prompt, voice=True):
+        return "Готово, я создала задачу."
+
+    counts = iter([[2, 0, 1], [2, 0, 1]])
+    monkeypatch.setattr(plugin, "_ask_astra", fake_ask)
+    monkeypatch.setattr(AstraAutoAssistant, "_astra_task_counts",
+                        staticmethod(lambda: next(counts)))
+
+    result = asyncio.run(plugin._handoff(
+        [{"account_id": "a1", "uid": "11", "from_name": "Я",
+          "subject": "проверка", "tasks": [], "reminders": []}]))
+    assert result["success"] is False
+    assert result["verified"] is False
+    assert "не создала" in result["error"]
+    assert result["answer"] == "Готово, я создала задачу."
+    state = store.load_state()
+    assert state["handoff_error"]
+    assert "Готово" in state["handoff_answer"]
+    assert "handled" not in state["digest"][0]
+
+
 def test_astra_task_counts_best_effort(tmp_path, monkeypatch):
     # Verification reads Astra's own tasks/reminders/calendar; a missing or
     # unreadable file means "skip verification", never an exception.
@@ -246,3 +303,118 @@ def test_own_mail_is_high_in_digest_summary_and_handoff_list(tmp_path, monkeypat
     assert state["digest"][0]["importance"] == "high"
     assert "важных 1" in report       # the summary counts it too
     assert state["acct_status"]["a1"]["new_count"] == 1
+    assert state["digest"][0]["uid"] == "5"
+    assert state["digest"][0]["body"] == "тест"
+
+
+def _isolated_handoff(tmp_path, monkeypatch, counts):
+    from src import store
+    monkeypatch.setattr(store, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(store, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(store, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(store, "_migrated", True)
+    store.save_settings(store.DEFAULT_SETTINGS)
+    plugin = AstraAutoAssistant()
+    plugin.host = object()
+    async def fake_ask(*args, **kwargs):
+        return "Готово"
+    values = iter(counts)
+    monkeypatch.setattr(plugin, "_ask_astra", fake_ask)
+    monkeypatch.setattr(plugin, "_astra_task_counts", lambda: next(values))
+    return plugin
+
+
+def test_manual_handoff_handles_legacy_digest_without_uid(tmp_path, monkeypatch):
+    import asyncio
+    import time
+    from src import store
+    plugin = _isolated_handoff(tmp_path, monkeypatch, [[0, 0, 0], [1, 0, 0]])
+    store.add_digest_item({"id": "a:11", "account_id": "a", "ts": time.time(),
+                           "importance": "high", "tasks": ["Подготовить отчёт"]})
+    assert asyncio.run(plugin.ui_handoff())["success"] is True
+    assert store.load_state()["digest"][0]["handled"] is True
+    assert "error" in asyncio.run(plugin.ui_handoff())
+
+
+def test_partial_batch_only_handles_the_successful_letter(tmp_path, monkeypatch):
+    import asyncio
+    from src import store
+    plugin = _isolated_handoff(tmp_path, monkeypatch,
+                              [[0, 0, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0]])
+    items = [{"id": "a:1", "tasks": ["Первая задача"]},
+             {"id": "a:2", "tasks": ["Вторая задача"]}]
+    for item in items:
+        store.add_digest_item(item)
+    result = asyncio.run(plugin._handoff(items))
+    assert result["success"] is False
+    digest = {i["id"]: i for i in store.load_state()["digest"]}
+    assert digest["a:1"]["handled"] is True
+    assert not digest["a:2"].get("handled")
+    assert store.load_state()["handoff_error"]
+
+
+def test_one_task_does_not_confirm_two_requested_tasks(tmp_path, monkeypatch):
+    import asyncio
+    plugin = _isolated_handoff(tmp_path, monkeypatch, [[0, 0, 0], [1, 0, 0]])
+    result = asyncio.run(plugin._handoff([
+        {"id": "a:1", "tasks": ["Первая", "Вторая"]}]))
+    assert result["success"] is False
+
+
+def test_unavailable_verification_does_not_accept_model_claim(tmp_path, monkeypatch):
+    import asyncio
+    plugin = _isolated_handoff(tmp_path, monkeypatch, [None, None])
+    result = asyncio.run(plugin._handoff([{"id": "a:1", "tasks": ["Задача"]}]))
+    assert result["success"] is False and result["verified"] is None
+
+
+def test_chat_error_discards_partial_triage_reply():
+    import asyncio
+    class Chunk:
+        def __init__(self, kind, text="", error=""):
+            self.kind, self.text, self.error = kind, text, error
+        def WhichOneof(self, name):
+            return self.kind
+    class Host:
+        async def send_chat_message(self, *args, **kwargs):
+            yield Chunk("text", text="1 | high | summary | task | -")
+            yield Chunk("error", error="failed")
+    plugin = AstraAutoAssistant()
+    plugin.host = Host()
+    assert asyncio.run(plugin._ask_astra("test")) == ""
+    assert plugin._llm_error == "failed"
+
+
+def test_chat_does_not_require_python_311_timeout(monkeypatch):
+    import asyncio
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
+    class Chunk:
+        text = "reply"
+        def WhichOneof(self, name):
+            return "text"
+    class Host:
+        async def send_chat_message(self, *args, **kwargs):
+            yield Chunk()
+    plugin = AstraAutoAssistant()
+    plugin.host = Host()
+    assert asyncio.run(plugin._ask_astra("test")) == "reply"
+
+
+def test_navigation_icon_embeds_plugin_png():
+    import asyncio
+    import base64
+    icon = Path(__file__).resolve().parent.parent / "icon.png"
+    contributions = asyncio.run(AstraAutoAssistant().get_ui_contributions())
+    page = next(c for c in contributions if c.slot == "page.custom")
+    assert base64.b64encode(icon.read_bytes()).decode("ascii") in page.icon_svg
+    assert page.transparent is True
+
+
+def test_header_icon_is_available_outside_ui_asset_route():
+    import asyncio
+    import base64
+    icon = Path(__file__).resolve().parent.parent / "icon.png"
+    result = asyncio.run(AstraAutoAssistant().ui_get_icon())
+    assert result["data_uri"].startswith("data:image/png;base64,")
+    assert base64.b64decode(result["data_uri"].split(",", 1)[1]) == icon.read_bytes()
+    assert icon.stat().st_size < 128000

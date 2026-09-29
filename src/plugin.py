@@ -14,6 +14,7 @@ What it does:
 
 import ast
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -62,6 +63,8 @@ class AstraAutoAssistant(Plugin):
         self._poll_lock: Optional[asyncio.Lock] = None  # created inside the loop
         self._last_summary = ""
         self._llm_error = ""   # human-readable reason the LLM triage is off
+        self._chat_lock = asyncio.Lock()
+        self._handoff_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -251,6 +254,8 @@ class AstraAutoAssistant(Plugin):
                 for it in triaged:
                     digest_item = {
                         "id": f"{it.get('account_id')}:{it['uid']}",
+                        "uid": it["uid"],
+                        "body": it.get("body", ""),
                         "ts": time.time(),
                         "mail_ts": it.get("ts") or 0,
                         "account_id": it.get("account_id"),
@@ -301,7 +306,7 @@ class AstraAutoAssistant(Plugin):
             # made the tab look broken: the letter got triaged and the
             # trigger fired, but no task request ever left the plugin.
             if high and settings.get("auto_handoff"):
-                await self._handoff(high)
+                await self._handoff(self._unhandled_high(48))
             return self._last_summary
 
     async def _fire_important(self, item: Dict[str, Any]) -> None:
@@ -336,23 +341,31 @@ class AstraAutoAssistant(Plugin):
             self._llm_error = "нет канала к чату Astra"
             return ""
         parts: List[str] = []
+        chat_failed = False
+
+        async def collect() -> None:
+            nonlocal chat_failed
+            async for chunk in self.host.send_chat_message(
+                    prompt, voice_enabled=voice):
+                kind = chunk.WhichOneof("content")
+                if kind == "text":
+                    parts.append(chunk.text)
+                elif kind == "error":
+                    logger.warning(f"Astra chat error: {chunk.error}")
+                    self._llm_error = str(chunk.error)[:300]
+                    chat_failed = True
+                    break
+                elif kind == "done":
+                    break
         try:
-            async with asyncio.timeout(_LLM_TIMEOUT_SECONDS):
-                async for chunk in self.host.send_chat_message(
-                        prompt, voice_enabled=voice):
-                    kind = chunk.WhichOneof("content")
-                    if kind == "text":
-                        parts.append(chunk.text)
-                    elif kind == "error":
-                        logger.warning(f"Astra chat error: {chunk.error}")
-                        self._llm_error = str(chunk.error)[:300]
-                        break
-                    elif kind == "done":
-                        break
+            async with self._chat_lock:
+                await asyncio.wait_for(collect(), timeout=_LLM_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
+            chat_failed = True
             self._llm_error = "Astra не ответила вовремя (таймаут 180 с)"
             logger.warning("Astra chat timed out")
         except Exception as e:
+            chat_failed = True
             msg = str(e)
             if "send_chat_message" in msg and "PERMISSION_DENIED" in msg:
                 # Installing from a local .astraplugin file (tier 2) refuses
@@ -366,8 +379,9 @@ class AstraAutoAssistant(Plugin):
                 self._llm_error = msg[:300]
             logger.warning(f"Astra chat failed: {e}")
         else:
-            self._llm_error = ""
-        return "".join(parts)
+            if not chat_failed:
+                self._llm_error = ""
+        return "" if chat_failed else "".join(parts)
 
     @staticmethod
     def _unhandled_high(hours: float) -> List[Dict[str, Any]]:
@@ -436,6 +450,29 @@ class AstraAutoAssistant(Plugin):
         return cleaned or t
 
     async def _handoff(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Verify each letter separately; a partial batch never handles all mail."""
+        if self._handoff_lock.locked():
+            return {"success": False, "error": "Создание задач уже выполняется"}
+        async with self._handoff_lock:
+            results = []
+            for item in items:
+                current = {i.get("id"): i for i in store.load_state().get("digest", [])}
+                key = item.get("id") or f"{item.get('account_id')}:{item.get('uid')}"
+                if item.get("handled") or current.get(key, {}).get("handled"):
+                    continue
+                results.append(await self._handoff_one([item]))
+            if not results:
+                return {"success": False, "error": "Нет необработанных важных писем"}
+            if len(results) == 1:
+                return results[0]
+            errors = [r["error"] for r in results if not r["success"]]
+            answer = "\n".join(r.get("answer", "") for r in results if r.get("answer"))
+            error = f"Не обработано писем: {len(errors)}. {errors[0]}" if errors else ""
+            self._save_handoff_result(not errors, error, answer, [], not errors)
+            return {"success": not errors, "answer": answer, "error": error,
+                    "verified": not errors}
+
+    async def _handoff_one(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Ask Astra to turn digest findings into real tasks/reminders.
 
         Returns {"success": False, "error": …} when the chat channel is
@@ -468,7 +505,15 @@ class AstraAutoAssistant(Plugin):
             d_tasks = after[0] - before[0]
             d_rems = after[1] - before[1]
             d_cal = after[2] - before[2]
-            verified = (d_tasks + d_rems + d_cal) > 0
+            item = items[0]
+            needed_tasks = len(item.get("tasks") or [])
+            if not needed_tasks and not item.get("reminders"):
+                needed_tasks = 1
+            has_deadline = bool(item.get("reminders"))
+            verified = (d_tasks >= needed_tasks
+                        and (not has_deadline or mode == "reminders" or d_cal > 0)
+                        and (not has_deadline or mode == "calendar" or d_rems > 0)
+                        and (d_tasks + d_rems + d_cal) > 0)
             note = (f" (проверка: создано задач {d_tasks}, напоминаний "
                     f"{d_rems}, записей в календаре {d_cal})")
         if not answer:
@@ -479,10 +524,16 @@ class AstraAutoAssistant(Plugin):
             reason = self._llm_error or "Astra не ответила (пустой ответ)"
             self._save_handoff_result(False, reason, "", items, None)
             return {"success": False, "error": reason}
-        if not verified and before is not None and after is not None:
-            note = (" (проверка: новых задач, напоминаний и записей в "
-                    "календаре НЕ появилось — Астра ответила текстом, не "
-                    "вызвав инструменты; нажми кнопку ещё раз)")
+        if verified is not True:
+            reason = ("Астра ответила, но не создала всех ожидаемых задач, напоминаний или "
+                      "записей в календаре. Письма оставлены для повторной "
+                      "попытки.")
+            if verified is None:
+                reason = "Не удалось проверить создание задач: файлы Astra недоступны."
+            clean = self._clean_handoff_answer(answer)
+            self._save_handoff_result(False, reason, clean, items, verified)
+            return {"success": False, "error": reason, "answer": clean,
+                    "verified": verified}
         clean = self._clean_handoff_answer(answer)
         if verified and (not clean or "⟨" in clean):
             # The reply was a parroted format (triage line / JSON), not a
@@ -501,11 +552,11 @@ class AstraAutoAssistant(Plugin):
         """Persist what the handoff did so the tab can show it (and so the
         same letters are not re-sent on the next handoff)."""
         try:
-            # Handled only when creation is confirmed (or unverifiable):
+            # Handled only when creation is confirmed:
             # a hallucinated "created" must stay re-sendable.
-            if ok and verified is not False:
+            if ok and verified is True:
                 store.mark_digest_handled(
-                    [f"{it.get('account_id')}:{it['uid']}" for it in items])
+                    [it.get("id") or f"{it.get('account_id')}:{it['uid']}" for it in items])
         except Exception:
             pass
         try:
@@ -623,8 +674,17 @@ class AstraAutoAssistant(Plugin):
         # super() carries the @ui_page tab — dropping this call removes the
         # tab from navigation (SDK >= 0.6 keeps pages only in the base method).
         contributions = await super().get_ui_contributions()
+        icon_path = Path(__file__).resolve().parent.parent / "icon.png"
+        page_icon = None
+        if icon_path.is_file():
+            icon_data = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+            page_icon = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+                         f'<image width="512" height="512" href="data:image/png;base64,{icon_data}"/>'
+                         '</svg>')
         for c in contributions:
             if c.slot == "page.custom":
+                if page_icon:
+                    c.icon_svg = page_icon
                 # Glass theme needs the iframe itself transparent.
                 c.transparent = True
         return contributions
@@ -662,6 +722,13 @@ class AstraAutoAssistant(Plugin):
                 "last_summary": self._last_summary,
             },
         }
+
+    @ui_call("aa_get_icon")
+    async def ui_get_icon(self, **params: Any) -> Dict[str, Any]:
+        # UI assets are served from ui/; ../icon.png is outside that route.
+        icon_path = Path(__file__).resolve().parent.parent / "icon.png"
+        data = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+        return {"data_uri": f"data:image/png;base64,{data}"}
 
     @ui_call("aa_save_settings")
     async def ui_save_settings(self, **params: Any) -> Dict[str, Any]:
