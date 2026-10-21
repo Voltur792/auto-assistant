@@ -35,6 +35,9 @@ def _default_data_dir() -> Path:
     env = os.environ.get("AA_DATA_DIR")
     if env:
         return Path(env)
+    if __import__("sys").platform == "darwin":
+        from .platform_support import user_data
+        return user_data() / "auto-assistant"
     appdata = os.environ.get("APPDATA")
     if appdata:
         return Path(appdata) / "auto-assistant"
