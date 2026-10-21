@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<script src="http://astra-plugin.localhost/bridge/astra-bridge.js"></script>
+<script src="panel-bridge.js"></script>
 <link rel="stylesheet" href="style.css">
 <title>Помощник</title>
 </head>
 <body>
 <div class="container">
     <header>
-        <div class="brand"><img id="brandIcon" class="brand-icon" alt="" width="48" height="48" hidden><div><h1>Авто-Помощник</h1><p class="subtitle">Почта, задачи и сроки — в одном месте</p></div></div>
+        <div class="brand"><h1>Авто-Помощник</h1><p class="subtitle">Почта, задачи и сроки — в одном месте</p></div>
         <div class="header-right">
             <span id="statusPill" class="status loading">Загрузка…</span>
             <button id="refreshBtn" class="icon-btn" title="Проверить почту сейчас" aria-label="Проверить почту сейчас"><svg class="refresh-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"/></svg></button>
@@ -25,10 +25,12 @@
     <main>
         <section id="tab-digest" class="tab-content active">
             <div class="toolbar">
-                <button id="handoffBtn" class="btn primary" title="Попросить Астра создать задачи и напоминания по важным письмам (уже обработанные пропускаются)">✦ Создать задачи через Астра</button>
-                <button id="rewindBtn" class="btn" title="Разобрать последние непрочитанные письма каждого ящика (те, что лежали до установки плагина, обычно не показываются)">⟲ Последние письма</button>
+                <button id="handoffBtn" class="btn primary" title="Создать записи в штатных виджетах по подтверждённым актуальным действиям">Создать задачи в Astra</button>
+                <button id="retriageBtn" class="btn" title="Повторно оценить последние письма без создания задач">Переразобрать</button>
+                <button id="rewindBtn" class="btn" title="Разобрать последние непрочитанные письма каждого ящика (те, что лежали до установки плагина, обычно не показываются)">Последние письма</button>
                 <button id="clearDigestBtn" class="btn">Очистить</button>
             </div>
+            <div id="digestMsg" class="message" role="status" hidden></div>
             <div id="handoffNote" class="message" hidden></div>
             <div id="digestList" class="stack">
                 <div class="placeholder"><div class="spinner"></div></div>
@@ -37,7 +39,7 @@
 
         <section id="tab-mail" class="tab-content">
             <div class="card">
-                <h3>Автопомощник</h3>
+                <h2>Автопомощник</h2>
                 <div class="row">
                     <label class="switch">
                         <input type="checkbox" id="sEnabled" aria-label="Включить периодическую проверку почты">
@@ -68,14 +70,20 @@
                         <input type="checkbox" id="sLlm" aria-label="Разбирать письма умной моделью">
                         <span class="slider"></span>
                     </label>
-                    <span class="row-label">Разбор умной моделью (LLM из настроек Astra, ключи не нужны)</span>
+                    <span class="row-label">Разбор локальной моделью без доступа к инструментам</span>
+                </div>
+                <div class="grid2">
+                    <div class="form-group"><label for="sEndpoint">Адрес локальной модели</label>
+                        <input id="sEndpoint" type="url" placeholder="Автоматически из настроек LM Studio в Astra"></div>
+                    <div class="form-group"><label for="sModel">Имя модели</label>
+                        <input id="sModel" type="text" placeholder="Автоматически из настроек Astra"></div>
                 </div>
                 <div class="row">
                     <label class="switch">
                         <input type="checkbox" id="sHandoff" aria-label="Автоматически создавать задачи и напоминания">
                         <span class="slider"></span>
                     </label>
-                    <span class="row-label">Самой создавать у Астра задачи и напоминания по важным письмам</span>
+                    <span class="row-label">Создавать записи по новым важным письмам с подтверждённым действием</span>
                 </div>
                 <div class="row">
                     <label class="switch">
@@ -86,14 +94,14 @@
                 </div>
                 <div class="row">
                     <label class="switch">
-                        <input type="checkbox" id="sVoice" aria-label="Озвучивать ответ Астры" checked>
+                        <input type="checkbox" id="sVoice" aria-label="Вызывать голосовую автоматизацию важного письма" checked>
                         <span class="slider"></span>
                     </label>
-                    <span class="row-label">Озвучивать голосом ответ Астры о созданных задачах (важные письма)</span>
+                    <span class="row-label">Отправлять событие важного письма для голосовой автоматизации Astra</span>
                 </div>
             </div>
 
-            <h3 class="section-title">Почтовые ящики</h3>
+            <h2 class="section-title">Почтовые ящики</h2>
             <div id="acctList" class="stack"></div>
             <button id="addAcctBtn" class="btn add-btn">+ Добавить ящик</button>
 
@@ -109,7 +117,7 @@
 
             <div class="toolbar save-bar">
                 <span id="globalMsg" class="message"></span>
-                <button id="saveBtn" class="btn primary">💾 Сохранить</button>
+                <button id="saveBtn" class="btn primary">Сохранить</button>
             </div>
         </section>
     </main>

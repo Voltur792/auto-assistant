@@ -1,8 +1,8 @@
 [plugin]
 id = "auto-assistant"
 name = "Auto Assistant"
-version = "1.0.0"
-description = "Automatic assistant: reads mail (Yandex/Gmail over IMAP), triages it with an allow-list or Astra's own LLM, builds a digest with tasks and reminders, and fires a trigger your automations can react to."
+version = "1.1.0"
+description = "Reads mail over IMAP, finds actionable important messages with a local model, and creates tasks, reminders and calendar events in Astra's native widgets."
 author = "Voltur"
 license = "MIT"
 
@@ -17,12 +17,13 @@ runtimes = ["python"]
 tools = true            # Astra может спрашивать дайджест в чате
 actions = true          # шаги для редактора автоматизаций (дайджест почты)
 triggers = true         # «важное письмо найдено» -> запускает команду пользователя
-ui_contributions = true # вкладка «Помощник»
+ui_contributions = true # контроллер и панель «Помощник»
+dom_access = true       # authenticated native widget API in the Astra window
 
 # Куда плагин имеет право звонить НАРУЖУ (default-deny). Reasons are shown on
 # the consent sheet untranslated, so they are in English (check N7).
 [permissions]
-send_chat_message = { reason = "Asks Astra (the model you configured in Astra) to triage new mail and create tasks/reminders — no extra API keys are used" }
+dom_access = { reason = "Adds verified mail tasks and deadlines to Astra's native widgets, without letting the language model execute tools." }
 fire_trigger = { reason = "Starts your automation (for example, a voice announcement) when an important letter is found" }
 push_to_ui = { reason = "Refreshes the assistant tab when new mail arrives" }
 

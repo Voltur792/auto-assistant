@@ -24,7 +24,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Plugin root = parent of the src package.
 PLUGIN_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -71,6 +71,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "enabled": True,
     "poll_interval_minutes": 5,
     "llm_enabled": True,
+    "llm_endpoint": "",  # Empty: use Astra's selected localhost LM Studio profile.
+    "llm_model": "",
     "mode": "whitelist_llm",   # whitelist_llm | whitelist | llm | rules
     "auto_handoff": False,
     "max_messages": 20,
@@ -78,11 +80,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # Token economy: mail the keyword rules call obvious ads never reaches
     # the LLM — most mail is ads, and the rules verdict for them is enough.
     "skip_ads_llm": True,
-    # Speak Astra's handoff reply aloud (PluginChatRequest.voice_enabled) —
-    # the voice announcement the user asked for.
+    # Publish important_email for the user's voice automation.
     "voice_announce": True,
-    # Where deadlines land: calendar (core:add_calendar_event) | reminders
-    # (core:add_reminder) | both. calendar.json holds {date, text, time}.
+    # Native widgets for deadlines: calendar | reminders | both.
     "deadline_mode": "calendar",
     "accounts": [],
 }
@@ -93,7 +93,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     # It replaces the old seen_uids list, which held IMAP *sequence numbers*:
     # those are positions that shift when mail is deleted or archived, so new
     # letters kept matching "already seen" and the poller reported nothing.
-    "acct_status": {},
+    "acct_status": {},  # Each cursor includes the INBOX uidvalidity namespace.
     "digest": [],        # [{id, account_id, account_email, from_addr, from_name, subject, ts, importance, summary, tasks[], reminders[], source}]
     "last_poll": 0.0,
     "last_error": "",
@@ -221,6 +221,87 @@ def save_state(state: Dict[str, Any]) -> None:
         _write(STATE_FILE, state)
 
 
+def update_state(change: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
+    """Read, change and persist the latest state under ONE lock.
+
+    Callers must do network work before entering this short transaction.
+    """
+    with _LOCK:
+        state = load_state()
+        change(state)
+        save_state(state)
+        return state
+
+
+def upgrade_workflow() -> None:
+    """Revalidate cached proposals with current guards without creating records."""
+    from . import triage
+    from datetime import datetime
+    with _LOCK:
+        state = load_state()
+        if state.get("workflow_version", 0) >= triage.VERSION:
+            return
+        rejected_ids = set()
+        settings = load_settings()
+        for item in state.get("digest") or []:
+            if item.get("source") == "llm" and item.get("triage_version") in (3, triage.VERSION):
+                row = {k: item.get(k) for k in ("importance", "summary", "reason", "tasks", "deadlines",
+                                               "action_required", "confidence")}
+                try:
+                    refreshed = triage.parse(json.dumps({"items": [{"n": 1, **row}]}), [item],
+                                             datetime.now().astimezone())[0]
+                    item.update(refreshed)
+                    item["requires_review"] = False
+                    if not item.get("action_required"):
+                        item["auto_pending"] = False
+                        rejected_ids.add(item["id"])
+                    elif (settings.get("auto_handoff") and not item.get("handled")
+                            and not item.get("historical")
+                            and triage.has_current_action(item, 0, datetime.now().astimezone())):
+                        # Recover future/ongoing obligations previously excluded
+                        # solely because their email was older than 48h.
+                        item["auto_pending"] = True
+                except ValueError:
+                    item.update(action_required=False, tasks=[], reminders=[], deadlines=[],
+                                importance="normal", requires_review=True, auto_pending=False)
+                    rejected_ids.add(item["id"])
+            elif item.get("source") == "rules" and item.get("triage_version") == 3:
+                item.update(triage.rules(item.get("subject", ""), item.get("body", "")))
+                item["requires_review"] = item["importance"] == "high"
+                item["auto_pending"] = False
+            elif not item.get("handled") and item.get("triage_version") != triage.VERSION:
+                item.update(importance="normal", action_required=False,
+                            tasks=[], reminders=[], deadlines=[], requires_review=True,
+                            reason="Старый разбор: требуется повторная оценка")
+                item.setdefault("mail_ts", 0)  # Old import timestamps are not receive dates.
+            item.pop("handoff_plan", None)
+            item.pop("handoff_completed", None)
+        for job in state.get("widget_jobs") or []:
+            if job.get("mail_id") in rejected_ids and job.get("status") in ("pending", "running"):
+                job.update(status="cancelled", error="Действие не подтверждено повторной проверкой")
+        for item in state.get("digest") or []:
+            if (item.get("id") in rejected_ids and (item.get("importance") == "low"
+                    or triage.information_reason(item.get("subject", ""), item.get("body", "")))):
+                item["native_review"] = any(j.get("status") == "done" and item["id"] in
+                    j.get("mail_ids", [j.get("mail_id")]) for j in state.get("widget_jobs") or [])
+        state.update(workflow_version=triage.VERSION)
+        state["handoff_pending"] = any(j.get("status") in ("pending", "running")
+                                      for j in state.get("widget_jobs") or [])
+        if not state.get("widget_jobs"):
+            state.update(handoff_error="", handoff_answer="", handoff_pending=False)
+        save_state(state)
+
+
+def adopt_uidvalidity(state: Dict[str, Any], account_id: str, validity: str) -> None:
+    """Adopt a namespace for old mail while keeping stable ids and progress."""
+    for item in state.get("digest") or []:
+        if item.get("account_id") == account_id and not item.get("uidvalidity"):
+            uid = str(item.get("uid") or str(item.get("id", "")).rsplit(":", 1)[-1])
+            if uid.isdigit():
+                # Keep the stable id: an in-flight handoff may reference it.
+                item.update(uid=uid, uidvalidity=validity)
+
+
 def add_digest_item(item: Dict[str, Any]) -> bool:
     """Prepend a digest item (newest first) and persist.
 
@@ -235,9 +316,17 @@ def add_digest_item(item: Dict[str, Any]) -> bool:
         if not isinstance(digest, list):
             digest = []
         for i, old in enumerate(digest):
-            if old.get("id") == item.get("id"):
+            same_mail = (bool(item.get("uidvalidity"))
+                         and old.get("account_id") == item.get("account_id")
+                         and old.get("uidvalidity") == item.get("uidvalidity")
+                         and str(old.get("uid")) == str(item.get("uid")))
+            if old.get("id") == item.get("id") or same_mail:
+                item["id"] = old["id"]
                 if old.get("handled"):
                     item["handled"] = True
+                for key in ("handoff_plan", "handoff_completed"):
+                    if key in old:
+                        item[key] = copy.deepcopy(old[key])
                 digest[i] = item
                 state["digest"] = digest
                 save_state(state)

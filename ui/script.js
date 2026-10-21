@@ -85,6 +85,11 @@ function renderStatus() {
         pill.textContent = 'Пауза';
         return;
     }
+    if (st.polling) {
+        pill.className = 'status loading';
+        pill.textContent = 'Проверяю и разбираю письма…';
+        return;
+    }
     if (st.last_error) {
         pill.className = 'status err';
         pill.textContent = st.last_error.slice(0, 90);
@@ -102,7 +107,12 @@ function renderStatus() {
         // «Создать задачи через Астра» не сработал — говорим почему.
         pill.className = 'status err';
         pill.title = st.handoff_error;
-        pill.textContent = 'Хэндофф: ' + st.handoff_error.replace(/\s+/g, ' ').slice(0, 80);
+        pill.textContent = 'Запись: ' + st.handoff_error.replace(/\s+/g, ' ').slice(0, 80);
+        return;
+    }
+    if (st.native_bridge_ready === false) {
+        pill.className = 'status err';
+        pill.textContent = 'Нет связи со штатными виджетами Astra';
         return;
     }
     const secs = Math.max(0, Math.round(statusDeadline - Date.now() / 1000));
@@ -125,9 +135,9 @@ function renderDigest() {
     if (!S.digest.length) {
         const hasAcct = (((S.settings || {}).accounts) || []).length;
         const hint = hasAcct
-            ? 'Пока пусто. Сообщаю только о письмах, пришедших после первой проверки — нажми «⟲ Последние письма», чтобы разобрать то, что уже лежит непрочитанным.'
+            ? 'Пока пусто. Сообщаю только о письмах, пришедших после первой проверки — нажми «Последние письма», чтобы разобрать то, что уже лежит непрочитанным.'
             : 'Пока пусто. Добавь почтовый ящик во вкладке «Почта» — помощник разберёт новые письма.';
-        box.innerHTML = `<div class="placeholder"><div class="big">✉️</div>${hint}</div>`;
+        box.innerHTML = `<div class="placeholder"><div class="big"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 6 9 7 9-7"/></svg></div>${hint}</div>`;
         return;
     }
     box.innerHTML = S.digest.map((it) => {
@@ -140,12 +150,13 @@ function renderDigest() {
                     <div class="item-subject">${esc(it.subject || '(без темы)')}</div>
                     <div class="item-from">${esc(it.from_name || it.from_addr)} · ${esc(it.account_email)}</div>
                 </div>
-                <span class="badge ${esc(it.importance)}">${IMP_LABEL[it.importance] || ''}</span>
-                ${it.handled ? '<span class="badge handled" title="Задачи по этому письму уже запрошены у Астры — повторно не отправляется">✓ задачи запрошены</span>' : ''}
+                <span class="badge ${esc(it.importance)}">${it.analysis_pending ? 'Ждёт разбора' : IMP_LABEL[it.importance] || ''}</span>
+                ${it.native_review ? '<span class="badge handled" title="Ранее созданные записи требуют проверки после исправления разбора">Проверить записи в Astra</span>' : it.handled ? `<span class="badge handled">${it.native_verified ? 'Создано в Astra' : 'Ранее обработано'}</span>` : ''}
             </div>
             ${it.summary ? `<div class="item-summary">${esc(it.summary)}</div>` : ''}
+            ${it.reason ? `<div class="item-meta">Почему: ${esc(it.reason)}</div>` : ''}
             ${lists.length ? `<div class="item-lists">${lists.join('')}</div>` : ''}
-            <div class="item-meta">${fmtTime(it.mail_ts || it.ts)} · ${it.source === 'llm' ? 'разбор: модель Astra' : 'разбор: правила'}</div>
+            <div class="item-meta">${fmtTime(it.mail_ts || it.ts)} · ${it.requires_review ? 'нужен повторный разбор' : it.source === 'llm' ? 'разбор: локальная модель' : 'разбор: правила'}</div>
         </div>`;
     }).join('');
 }
@@ -158,11 +169,11 @@ function renderHandoffNote() {
         el.hidden = false;
         el.className = 'message error';
         el.textContent = 'Создание задач не подтверждено: ' + st.handoff_error +
-            (st.handoff_answer ? ' Ответ Астры: ' +
+            (st.handoff_answer ? ' Состояние: ' +
                 st.handoff_answer.replace(/\s+/g, ' ').slice(0, 240) : '');
     } else if (st.handoff_answer) {
         el.hidden = false;
-        el.className = 'message success';
+        el.className = st.handoff_pending ? 'message' : 'message success';
         el.textContent = st.handoff_answer.replace(/\s+/g, ' ').slice(0, 300);
     } else {
         el.hidden = true;
@@ -213,6 +224,8 @@ function fillGlobalForm() {
     $('sInterval').value = s.poll_interval_minutes ?? 5;
     $('sMax').value = s.max_messages ?? 20;
     $('sLlm').checked = !!s.llm_enabled;
+    $('sEndpoint').value = s.llm_endpoint || '';
+    $('sModel').value = s.llm_model || '';
     $('sHandoff').checked = !!s.auto_handoff;
     $('sSkipAds').checked = s.skip_ads_llm !== false;
     $('sVoice').checked = s.voice_announce !== false;
@@ -251,13 +264,13 @@ function syncOne(card, acct) {
 
 function syncAllFromDom() {
     document.querySelectorAll('#acctList .acct-card').forEach((card) => {
-        syncOne(card, (S.settings.accounts || [])[+card.dataset.idx]);
+        syncOne(card, (S.settings.accounts || []).find((a) => a.id === card.dataset.accountId));
     });
 }
 
 function updateAcctStatuses() {
     document.querySelectorAll('#acctList .acct-card').forEach((card) => {
-        const acct = (S.settings.accounts || [])[+card.dataset.idx];
+        const acct = (S.settings.accounts || []).find((a) => a.id === card.dataset.accountId);
         if (!acct) return;
         const el = card.querySelector('.acct-state');
         const [cls, text] = acctStatusText(acct);
@@ -273,6 +286,7 @@ function accountCard(acct, idx) {
     const card = document.createElement('div');
     card.className = 'card acct-card';
     card.dataset.idx = String(idx);
+    card.dataset.accountId = acct.id;
     const isCustom = acct.provider === 'custom';
     // Новый (незаполненный) ящик раскрываем сразу, готовые — в компактную строку.
     let open = acctExpanded.has(acct.id) || !(acct.email && acct.has_password);
@@ -337,7 +351,7 @@ function accountCard(acct, idx) {
         card.querySelector('.acct-mail').textContent = e.target.value.trim() || 'Адрес не указан';
     });
     dropdown(card.querySelector('.dd-slot'), PROVIDERS, acct.provider || 'yandex', (v) => {
-        syncOne(card, acct);
+        syncAllFromDom();
         acct.provider = v;
         renderAccounts();
     });
@@ -360,7 +374,7 @@ function accountCard(acct, idx) {
     };
     card.querySelector('.f-del').onclick = () => {
         syncAllFromDom();
-        S.settings.accounts.splice(idx, 1);
+        S.settings.accounts = S.settings.accounts.filter((a) => a.id !== acct.id);
         acctExpanded.delete(acct.id);
         renderAccounts();
     };
@@ -372,6 +386,8 @@ function collectGlobal() {
     S.settings.poll_interval_minutes = parseInt($('sInterval').value, 10) || 5;
     S.settings.max_messages = parseInt($('sMax').value, 10) || 20;
     S.settings.llm_enabled = $('sLlm').checked;
+    S.settings.llm_endpoint = $('sEndpoint').value.trim();
+    S.settings.llm_model = $('sModel').value.trim();
     S.settings.auto_handoff = $('sHandoff').checked;
     S.settings.skip_ads_llm = $('sSkipAds').checked;
     S.settings.voice_announce = $('sVoice').checked;
@@ -379,7 +395,9 @@ function collectGlobal() {
 }
 
 function flash(text, ok) {
-    const m = $('globalMsg');
+    const onDigest = document.querySelector('.tab-btn.active')?.dataset.tab === 'digest';
+    const m = $(onDigest ? 'digestMsg' : 'globalMsg');
+    m.hidden = false;
     m.className = 'message ' + (ok ? 'success' : 'error');
     m.textContent = text;
     setTimeout(() => { if (m.textContent === text) m.textContent = ''; }, 6000);
@@ -401,11 +419,31 @@ $('saveBtn').onclick = async (e) => {
     syncAllFromDom();   // перечитать поля всех ящиков из DOM
     e.target.disabled = true;
     try {
-        const r = await call('aa_save_settings', { settings: S.settings });
-        if (r && r.success) flash('Сохранено ✓', true);
-        else flash((r && r.error) || 'Не удалось сохранить', false);
+        const submitted = JSON.stringify(S.settings);
+        const r = await call('aa_save_settings', { settings: JSON.parse(submitted) });
+        if (r && r.success) {
+            collectGlobal();
+            syncAllFromDom();
+            if (JSON.stringify(S.settings) === submitted) {
+                S.settings = r.settings;
+                fillGlobalForm();
+                renderAccounts();
+                flash('Сохранено ✓', true);
+            } else {
+                // Edits made while awaiting the backend remain a draft.
+                for (const a of S.settings.accounts || []) {
+                    const newId = (r.account_ids || {})[a.id];
+                    if (!newId) continue;
+                    document.querySelectorAll('#acctList .acct-card').forEach((card) => {
+                        if (card.dataset.accountId === a.id) card.dataset.accountId = newId;
+                    });
+                    if (acctExpanded.delete(a.id)) acctExpanded.add(newId);
+                    a.id = newId;
+                }
+                flash('Сохранено ✓. Новые изменения ещё не сохранены.', true);
+            }
+        } else flash((r && r.error) || 'Не удалось сохранить', false);
         await refresh();
-        renderAccounts();   // строки должны показать сохранённые адреса и статусы
     } catch (err) {
         flash(String(err), false);
     } finally { e.target.disabled = false; }
@@ -427,12 +465,12 @@ $('refreshBtn').onclick = async () => {
 $('handoffBtn').onclick = async (e) => {
     e.target.disabled = true;
     const old = e.target.textContent;
-    e.target.textContent = 'Астра думает…';
+    e.target.textContent = 'Готовлю записи…';
     try {
         const r = await call('aa_handoff');
         if (r && r.error) flash(r.error, false);
-        else if (r && r.answer) flash('Передано Астра: ' + r.answer.slice(0, 160), true);
-        else flash('Передано Астра ✓', true);
+        else if (r && r.answer) flash(r.answer.slice(0, 220), true);
+        else flash('Проверь состояние записи над дайджестом.', true);
         await refresh();
     } catch (err) { flash(String(err), false); }
     finally { e.target.disabled = false; e.target.textContent = old; }
@@ -453,16 +491,22 @@ $('rewindBtn').onclick = async (e) => {
 };
 
 $('clearDigestBtn').onclick = async () => { try { await call('aa_clear_digest'); await refresh(); } catch (e) {} };
+$('retriageBtn').onclick = async (event) => {
+    event.target.disabled = true;
+    try {
+        const result = await call('aa_retriage');
+        flash(result.error || result.report, !result.error);
+        await refresh();
+    } catch (error) { flash(String(error), false); }
+    finally { event.target.disabled = false; }
+};
 
 /* ---------- Загрузка состояния ---------- */
 async function refresh() {
     const r = await call('aa_get_state');
-    const mailActive = loadedOnce &&
-        document.querySelector('.tab-btn.active') &&
-        document.querySelector('.tab-btn.active').dataset.tab === 'mail';
-    if (mailActive) {
-        // На вкладке «Почта» форму не перезаписываем — только подтягиваем
-        // статусы ящиков, чтобы не затереть несохранённый ввод.
+    if (loadedOnce) {
+        // S.settings is the form draft on EVERY tab. Background updates may
+        // refresh status, but only an explicit successful save replaces it.
         const srv = {};
         (r.settings.accounts || []).forEach((a) => { srv[a.id] = a.status || {}; });
         (S.settings.accounts || []).forEach((a) => { a.status = srv[a.id] || {}; });
@@ -497,10 +541,4 @@ refresh().catch((e) => {
     $('statusPill').textContent = 'Бэкенд недоступен';
     $('digestList').innerHTML = `<div class="placeholder error">${esc(String(e))}</div>`;
 });
-call('aa_get_icon').then((result) => {
-    if (result && result.data_uri) {
-        $('brandIcon').src = result.data_uri;
-        $('brandIcon').hidden = false;
-    }
-}).catch(() => {});
 setInterval(() => { refresh().catch(() => {}); }, 30000);

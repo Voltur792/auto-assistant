@@ -2,12 +2,9 @@
 
 What it does:
 * polls IMAP mailboxes (Yandex / Gmail / custom) on its own schedule;
-* triages new mail — allow-list, keyword rules, or Astra's own LLM asked
-  through SendChatMessage (no extra API keys — the model Astra is configured
-  with does the thinking);
+* triages new mail using conservative rules and tool-free local inference;
 * keeps a digest with proposed tasks/reminders, exposes it to Astra as tools;
-* asks Astra (in its own plugin conversation) to create real tasks/reminders
-  when auto-handoff is on, or when the user presses the button;
+* queues validated native widget records for the dom_access controller;
 * fires the `important_email` trigger so the user's automations can react
   (for example, a voice announcement).
 """
@@ -17,53 +14,44 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import sys
 import time
 import traceback
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from astra_plugin_sdk import (
-    Field,
     Plugin,
     UiContribution,
     action,
     tool,
     trigger,
     ui_call,
-    ui_page,
 )
 
-from . import analyze, mailer, store
+from . import analyze, inference, jobs, mailer, store, triage
 
 logger = logging.getLogger(__name__)
 
 _MODES = ("whitelist", "rules", "llm", "whitelist_llm")
 _TICK_SECONDS = 20          # poller wake-up granularity
-_LLM_TIMEOUT_SECONDS = 180  # one Astra round-trip
 
 
-@ui_page(
-    "auto-assistant",
-    "Помощник",
-    "assistant.html",
-    icon_svg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-             '<path fill="currentColor" d="M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16'
-             'a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 4-8 5-8-5V6l8 5 8-5z"/>'
-             '<path fill="currentColor" d="m17.5 1.5.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1'
-             '-2.1-.9 2.1-.9z"/></svg>',
-)
 class AstraAutoAssistant(Plugin):
     """Astra plugin: auto-assistant."""
 
     def __init__(self) -> None:
         super().__init__()
         self._poller_task: Optional[asyncio.Task] = None
+        self._manual_task: Optional[asyncio.Task] = None
         self._poll_lock: Optional[asyncio.Lock] = None  # created inside the loop
         self._last_summary = ""
         self._llm_error = ""   # human-readable reason the LLM triage is off
-        self._chat_lock = asyncio.Lock()
+        self._inference_lock = asyncio.Lock()
+        self._inference_retry_after = 0.0
+        self._bridge_last_seen = 0.0
         self._handoff_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -73,6 +61,7 @@ class AstraAutoAssistant(Plugin):
     async def on_config_changed(self, config: Dict[str, Any]) -> None:
         # The daemon delivers the initial config on start — the earliest
         # reliable place to start background work.
+        store.upgrade_workflow()
         self._ensure_poller()
 
     async def health_check(self):
@@ -84,6 +73,8 @@ class AstraAutoAssistant(Plugin):
     async def on_shutdown(self) -> None:
         if self._poller_task is not None and not self._poller_task.done():
             self._poller_task.cancel()
+        if self._manual_task is not None and not self._manual_task.done():
+            self._manual_task.cancel()
 
     def _ensure_poller(self) -> None:
         if self._poll_lock is None:
@@ -119,7 +110,7 @@ class AstraAutoAssistant(Plugin):
             except Exception as e:  # never let the loop die
                 logger.error(f"poll loop tick failed: {e}")
 
-    async def poll_once(self, auto: bool) -> str:
+    async def poll_once(self, auto: bool, historical: bool = False) -> str:
         """Check every enabled account once; triage what is new."""
         if self._poll_lock is None:
             # Normally created by _ensure_poller(); a UI call that wins the
@@ -165,8 +156,9 @@ class AstraAutoAssistant(Plugin):
                 except (TypeError, ValueError):
                     baseline = None
                 try:
-                    msgs, uid_high = await asyncio.to_thread(
-                        mailer.fetch_new_emails, acct, baseline, max(limit, 1))
+                    msgs, uid_high, validity = await asyncio.to_thread(
+                        mailer.fetch_new_emails, acct, baseline, max(limit, 1),
+                        prev.get("uidvalidity"))
                 except Exception as e:
                     errors.append(f"{acct.get('email')}: {e}")
                     acct_updates[acct_id] = {
@@ -176,8 +168,15 @@ class AstraAutoAssistant(Plugin):
                         "new_count": 0,
                     }
                     continue
-                if baseline is None:
+                if baseline is None or (prev.get("uidvalidity") is not None
+                                        and str(prev["uidvalidity"]) != validity):
                     baselined.append(acct.get("email", ""))
+                if prev.get("uidvalidity") is None:
+                    # Adopt the first observed namespace without losing the
+                    # handled/progress flags on existing, pre-upgrade mail.
+                    def adopt(state, account_id=acct_id, uidvalidity=validity):
+                        store.adopt_uidvalidity(state, account_id, uidvalidity)
+                    store.update_state(adopt)
                 fresh: List[Dict[str, Any]] = []
                 for m in msgs:
                     # Bulk mail is marked, never dropped: a sender that looks
@@ -189,6 +188,7 @@ class AstraAutoAssistant(Plugin):
                                                         m["from_name"]):
                         continue
                     m["account_id"] = acct_id
+                    m["uidvalidity"] = validity
                     m["account_email"] = acct.get("email", "")
                     fresh.append(m)
                 new_items.extend(fresh)
@@ -198,95 +198,47 @@ class AstraAutoAssistant(Plugin):
                     "last_error": "",
                     "new_count": len(fresh),
                     "last_uid": uid_high,
+                    "uidvalidity": validity,
                 }
 
-            triaged: List[Dict[str, Any]] = []
-            source = "rules"
-            if new_items:
-                use_llm = bool(settings.get("llm_enabled", True)) and \
-                    mode in ("llm", "whitelist_llm") and self.host is not None
-                llm_idx: List[int] = []
-                parsed = None
-                if use_llm:
-                    # Token economy: most mail is ads. Items the keyword
-                    # rules call low never reach the LLM — the rules verdict
-                    # is good enough for "скидки, распродажи, рассылки".
-                    skip_ads = bool(settings.get("skip_ads_llm", True))
-                    rules_first = [analyze.classify_rules(
-                        it.get("subject", ""), it.get("body", ""))
-                        for it in new_items]
-                    llm_idx = [i for i, v in enumerate(rules_first)
-                               if not (skip_ads and (
-                                   v["importance"] == "low"
-                                   or new_items[i].get("bulk")))]
-                    if llm_idx:
-                        answer = await self._ask_astra(analyze.build_llm_prompt(
-                            [new_items[i] for i in llm_idx]))
-                        parsed = analyze.parse_llm_answer(answer)
-                        # Honest source: the LLM counts only when it actually
-                        # returned a parseable verdict; otherwise rules decided.
-                        source = "llm" if parsed else "rules"
-                    else:
-                        self._llm_error = ""
-                else:
-                    if not settings.get("llm_enabled", True):
-                        self._llm_error = "LLM выключен в настройках"
-                    elif mode not in ("llm", "whitelist_llm"):
-                        self._llm_error = f"режим «{mode}» не использует LLM"
-                triaged = analyze.merge_llm(new_items, parsed, llm_idx=llm_idx)
+            def mail_key(item):
+                return (item.get("account_id"), str(item.get("uidvalidity")), str(item.get("uid")))
+            fresh_keys = {mail_key(i) for i in new_items}
+            live_ids = {a["id"] for a in settings.get("accounts") or [] if a.get("enabled", True)}
+            pending_items = [] if historical else [i for i in store.load_state().get("digest") or []
+                if (i.get("analysis_pending") or i.get("auto_pending")) and not i.get("handled")
+                and not i.get("historical") and i.get("account_id") in live_ids
+                and (triage.is_recent(i, float(settings.get("handoff_hours", 24)), time.time())
+                     or triage.has_current_action(i, 0, datetime.now().astimezone()))]
+            retry_keys = {mail_key(i) for i in pending_items}
+            retries = [i for i in pending_items if mail_key(i) not in fresh_keys][:6]
+            work_items = new_items + retries
+            triaged = await self._triage_items(work_items, settings) if work_items else []
+            new_actionable = []
+            for it in triaged:
+                if it["account_id"] not in {a["id"] for a in store.load_settings()["accounts"]}:
+                    continue
+                digest_item = {
+                    **it, "id": f"{it['account_id']}:{it['uidvalidity']}:{it['uid']}",
+                    "mail_ts": it.get("mail_ts", it.get("ts")) or 0, "ts": time.time(),
+                    "historical": historical,
+                }
+                eligible = (not historical and triage.has_current_action(digest_item,
+                    float(settings.get("handoff_hours", 24)), datetime.now().astimezone()))
+                digest_item["auto_pending"] = bool(eligible and settings.get("auto_handoff")
+                    and (it.get("analysis_pending") or it.get("action_required")))
+                is_new = store.add_digest_item(digest_item)
+                if ((is_new or mail_key(it) in retry_keys) and digest_item.get("action_required") and eligible):
+                    new_actionable.append(digest_item)
 
-                # Final verdict, strongest first: mail from the user's own
-                # account is always high (a note to self / a test — neither
-                # the keyword rules nor the model scores it), bulk senders
-                # are never high. Applied to the triaged item ITSELF: an
-                # override that only touched the digest copy left the letter
-                # "important" in the tab while the handoff list (built from
-                # the raw verdicts) stayed empty — the trigger fired and no
-                # tasks were ever requested.
-                own_addrs = {(a.get("email") or "").strip().casefold()
-                             for a in settings.get("accounts") or []} - {""}
-                for it in triaged:
-                    if it.get("from_addr", "").casefold() in own_addrs:
-                        it["importance"] = "high"
-                    elif it.get("bulk"):
-                        it["importance"] = "low"
-
-                for it in triaged:
-                    digest_item = {
-                        "id": f"{it.get('account_id')}:{it['uid']}",
-                        "uid": it["uid"],
-                        "body": it.get("body", ""),
-                        "ts": time.time(),
-                        "mail_ts": it.get("ts") or 0,
-                        "account_id": it.get("account_id"),
-                        "account_email": it.get("account_email", ""),
-                        "from_name": it.get("from_name", ""),
-                        "from_addr": it.get("from_addr", ""),
-                        "subject": it.get("subject", ""),
-                        "importance": it.get("importance", "normal"),
-                        "summary": it.get("summary", ""),
-                        "tasks": it.get("tasks", []),
-                        "reminders": it.get("reminders", []),
-                        "source": source,
-                    }
-                    # Only a NEW digest entry fires the trigger: a letter
-                    # re-fetched after a rewind or a failed fetch must not
-                    # re-announce itself.
-                    if store.add_digest_item(digest_item) and \
-                            digest_item["importance"] == "high":
-                        await self._fire_important(digest_item)
-
-            state = store.load_state()
-            state["last_poll"] = time.time()
-            state["last_error"] = "; ".join(errors)[:500]
-            # Per-account status, pruned to the accounts that still exist.
-            live_ids = {a.get("id") or a.get("email")
-                        for a in settings.get("accounts") or []}
-            merged_status = {k: v for k, v in (state.get("acct_status") or {}).items()
-                             if k in live_ids}
-            merged_status.update(acct_updates)
-            state["acct_status"] = merged_status
-            store.save_state(state)
+            def finish_poll(state):
+                state["last_poll"] = time.time()
+                state["last_error"] = "; ".join(errors)[:500]
+                live_ids = {a["id"] for a in store.load_settings()["accounts"]}
+                status = state.setdefault("acct_status", {})
+                status.update({k: v for k, v in acct_updates.items() if k in live_ids})
+                state["acct_status"] = {k: v for k, v in status.items() if k in live_ids}
+            store.update_state(finish_poll)
 
             high = [t for t in triaged if t.get("importance") == "high"]
             note = ""
@@ -301,12 +253,12 @@ class AstraAutoAssistant(Plugin):
                 await self.push_to_ui("assistant", {"type": "updated"})
             except Exception:
                 pass
-            # Auto-handoff runs on ANY poll that found high letters — the
-            # manual "check now" button included. Gating it on `auto` only
-            # made the tab look broken: the letter got triaged and the
-            # trigger fired, but no task request ever left the plugin.
-            if high and settings.get("auto_handoff"):
-                await self._handoff(self._unhandled_high(48))
+            if (new_actionable and settings.get("auto_handoff")
+                    and not self._llm_error and not historical):
+                await self._handoff(new_actionable)
+            if new_actionable and not self._llm_error and settings.get("voice_announce", True):
+                for item in new_actionable:
+                    await self._fire_important(item)
             return self._last_summary
 
     async def _fire_important(self, item: Dict[str, Any]) -> None:
@@ -324,249 +276,108 @@ class AstraAutoAssistant(Plugin):
             logger.warning(f"fire_trigger(important_email) failed: {e}")
 
     # ------------------------------------------------------------------
-    # Astra as the LLM (SendChatMessage -> the assistant's configured model)
+    # Tool-free localhost inference
     # ------------------------------------------------------------------
 
-    async def _ask_astra(self, prompt: str, voice: bool = False) -> str:
-        """Send one message into the plugin's own Astra conversation and
-        collect the streamed reply. Empty string on any failure.
-
-        `voice=True` makes Astra SPEAK the reply aloud (PluginChatRequest.
-        voice_enabled) — that is the plugin's only voice channel.
-
-        Fills self._llm_error with a human-readable reason so the tab can
-        say WHY the smart triage is off (a permission refused at install
-        time is the common case — see the README, "LLM не работает")."""
-        if self.host is None:
-            self._llm_error = "нет канала к чату Astra"
-            return ""
-        parts: List[str] = []
-        chat_failed = False
-
-        async def collect() -> None:
-            nonlocal chat_failed
-            async for chunk in self.host.send_chat_message(
-                    prompt, voice_enabled=voice):
-                kind = chunk.WhichOneof("content")
-                if kind == "text":
-                    parts.append(chunk.text)
-                elif kind == "error":
-                    logger.warning(f"Astra chat error: {chunk.error}")
-                    self._llm_error = str(chunk.error)[:300]
-                    chat_failed = True
+    async def _triage_items(self, items: List[Dict[str, Any]], settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Read-only inference; an HTTP result is data and never a tool call."""
+        out = [{**it, **triage.rules(it.get("subject", ""), it.get("body", "")),
+                "analysis_pending": False} for it in items]
+        use_llm = settings.get("llm_enabled", True) and settings.get("mode") in ("llm", "whitelist_llm")
+        self._llm_error = ""
+        if not use_llm:
+            return out
+        candidates = [i for i, item in enumerate(out)
+                      if not (settings.get("skip_ads_llm", True) and item["importance"] == "low")]
+        if not candidates:
+            return out
+        for i in candidates:
+            out[i]["analysis_pending"] = True
+        if time.time() < self._inference_retry_after:
+            self._llm_error = "Разбор моделью временно приостановлен после сбоя."
+            return out
+        async with self._inference_lock:
+            if time.time() < self._inference_retry_after:
+                self._llm_error = "Разбор моделью временно приостановлен после сбоя."
+                return out
+            for offset in range(0, len(candidates), 3):
+                indices = candidates[offset:offset + 3]
+                now = datetime.now().astimezone()
+                batch = []
+                for i in indices:
+                    item = dict(items[i])
+                    stamp = item.get("mail_ts", item.get("ts"))
+                    item["received_at"] = datetime.fromtimestamp(stamp).astimezone().isoformat() if stamp else "unknown"
+                    batch.append(item)
+                try:
+                    answer = await asyncio.wait_for(asyncio.to_thread(
+                        inference.complete, batch, settings, now.isoformat()), timeout=inference.TIMEOUT + 5)
+                    parsed = triage.parse(answer, batch, now)
+                except (inference.InferenceError, ValueError, asyncio.TimeoutError):
+                    self._llm_error = ("Локальная модель не завершила корректный разбор. "
+                                       "Автосоздание по этой проверке отменено; повтор через 5 минут.")
+                    self._inference_retry_after = time.time() + 300
                     break
-                elif kind == "done":
-                    break
-        try:
-            async with self._chat_lock:
-                await asyncio.wait_for(collect(), timeout=_LLM_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            chat_failed = True
-            self._llm_error = "Astra не ответила вовремя (таймаут 180 с)"
-            logger.warning("Astra chat timed out")
-        except Exception as e:
-            chat_failed = True
-            msg = str(e)
-            if "send_chat_message" in msg and "PERMISSION_DENIED" in msg:
-                # Installing from a local .astraplugin file (tier 2) refuses
-                # this permission outright — only a sideload or a listed
-                # plugin can have it. Say so instead of a raw gRPC dump.
-                self._llm_error = ("право send_chat_message отказано: плагин "
-                                   "установлен из файла. Переустанови его "
-                                   "sideload-ом (astra-plugin dev) — там это "
-                                   "право доступно")
-            else:
-                self._llm_error = msg[:300]
-            logger.warning(f"Astra chat failed: {e}")
-        else:
-            if not chat_failed:
-                self._llm_error = ""
-        return "" if chat_failed else "".join(parts)
+                for i, item in zip(indices, parsed):
+                    out[i] = {**item, "analysis_pending": False, "requires_review": False}
+        return out
 
     @staticmethod
     def _unhandled_high(hours: float) -> List[Dict[str, Any]]:
         """High digest items whose tasks were not requested from Astra yet."""
-        return [i for i in store.recent_digest(hours)
-                if i.get("importance") == "high" and not i.get("handled")]
-
-    @staticmethod
-    def _astra_task_counts() -> Optional[List[int]]:
-        """Best-effort [tasks, reminders, calendar] counts from Astra's
-        own config.
-
-        The model in the plugin chat sometimes answers "created" without
-        calling any tool (the daemon log proves it: tool_calls=4 — all
-        tool-search lookups — zero dispatches). The only honest check is
-        Astra's tasks.json/reminders.json/calendar.json. None = files not
-        found there — verification is skipped, not fatal."""
-        appdata = os.environ.get("APPDATA")
-        if not appdata:
-            return None
-        cfg = Path(appdata) / "Astra" / "astra" / "config"
-        counts: List[int] = []
-        for name in ("tasks.json", "reminders.json", "calendar.json"):
-            try:
-                data = json.loads((cfg / name).read_text(encoding="utf-8"))
-            except Exception:
-                return None
-            counts.append(len(data) if isinstance(data, list) else 0)
-        return counts
-
-    @staticmethod
-    def _clean_handoff_answer(answer: str) -> str:
-        """Make the model's reply readable in the tab.
-
-        A small model answers the handoff with whatever format it answered
-        the last prompts in: tool-call JSON as text (parroting old call
-        examples), or a TRIAGE LINE («1 | normal | … | … | …») learned
-        from the triage prompt in the same conversation — both seen in the
-        wild as the whole reply. Raw formats in the tab are noise; the
-        verification note appended after it already says what actually
-        happened. Code fences, pure-JSON lines and triage-shaped lines are
-        collapsed into short markers, human text is kept.
-        """
-        t = (answer or "").strip()
-        lines = []
-        json_seen = False
-        triage_seen = False
-        for ln in t.splitlines():
-            s = ln.strip()
-            if s.startswith("```"):        # code fence, drop the line
-                continue
-            if s.startswith("{") and s.endswith("}"):
-                if not json_seen:
-                    lines.append("⟨ответила JSON-текстом вместо вызова "
-                                 "инструментов⟩")
-                    json_seen = True
-                continue
-            head = s.split("|", 1)[0].strip()
-            if head.isdigit() and s.count("|") >= 2:
-                if not triage_seen:
-                    lines.append("⟨ответила строкой разбора⟩")
-                    triage_seen = True
-                continue
-            lines.append(ln)
-        cleaned = "\n".join(lines).strip()
-        return cleaned or t
+        return [i for i in store.load_state().get("digest", [])
+                if i.get("importance") == "high" and not i.get("handled")
+                and triage.has_current_action(i, hours, datetime.now().astimezone())]
 
     async def _handoff(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Verify each letter separately; a partial batch never handles all mail."""
+        """Queue validated records for the explicitly authorised DOM controller."""
         if self._handoff_lock.locked():
-            return {"success": False, "error": "Создание задач уже выполняется"}
+            return {"success": False, "error": "Создание записей уже выполняется"}
         async with self._handoff_lock:
-            results = []
-            for item in items:
-                current = {i.get("id"): i for i in store.load_state().get("digest", [])}
-                key = item.get("id") or f"{item.get('account_id')}:{item.get('uid')}"
-                if item.get("handled") or current.get(key, {}).get("handled"):
-                    continue
-                results.append(await self._handoff_one([item]))
-            if not results:
-                return {"success": False, "error": "Нет необработанных важных писем"}
-            if len(results) == 1:
-                return results[0]
-            errors = [r["error"] for r in results if not r["success"]]
-            answer = "\n".join(r.get("answer", "") for r in results if r.get("answer"))
-            error = f"Не обработано писем: {len(errors)}. {errors[0]}" if errors else ""
-            self._save_handoff_result(not errors, error, answer, [], not errors)
-            return {"success": not errors, "answer": answer, "error": error,
-                    "verified": not errors}
+            settings = store.load_settings()
+            candidates = [i for i in items if not i.get("handled")]
+            if any(i.get("triage_version") != triage.VERSION for i in candidates):
+                candidates = await self._triage_items(candidates[:6], settings)
+                for item in candidates:
+                    store.add_digest_item(item)
+                if self._llm_error:
+                    return {"success": False, "error": self._llm_error}
+            ready = [i for i in candidates if i.get("action_required") and i.get("tasks")
+                     and i.get("triage_version") == triage.VERSION]
+            if not ready:
+                return {"success": False, "error": "Нет подтверждённых актуальных действий по письмам."}
+            mode = settings.get("deadline_mode", "calendar")
+            count = jobs.enqueue(ready, mode if mode in analyze.DEADLINE_MODES else "calendar")
+            return {"success": True, "pending": bool(store.load_state().get("handoff_pending")),
+                    "answer": f"Подготовлено записей для штатных виджетов Astra: {count}."}
 
-    async def _handoff_one(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Ask Astra to turn digest findings into real tasks/reminders.
-
-        Returns {"success": False, "error": …} when the chat channel is
-        unavailable (the tier-2 install ceiling is the common case) — the
-        caller shows the error instead of failing silently. On a reply the
-        outcome is VERIFIED against Astra's tasks.json: the model may claim
-        creation without calling a tool, and an unconfirmed claim stays
-        re-sendable instead of being marked handled."""
-        if self.host is None:
-            return {"success": False,
-                    "error": "нет канала к чату Astra (плагин не зарегистрирован)"}
-        settings = store.load_settings()
-        voice = bool(settings.get("voice_announce", True))
-        mode = settings.get("deadline_mode", "calendar")
-        if mode not in analyze.DEADLINE_MODES:
-            mode = "calendar"
-        before = self._astra_task_counts()
-        answer = await self._ask_astra(
-            analyze.build_handoff_prompt(items, deadline_mode=mode),
-            voice=voice)
-        # Verify FIRST, against Astra's own task files: the model may call
-        # the tools and then answer with NO final text (seen in the wild:
-        # add_task + add_calendar_event executed, empty reply) — an empty
-        # reply with grown counters is a SUCCESS, not a failure. The
-        # counters outrank both the reply text and its absence.
-        note = ""
-        verified: Optional[bool] = None
-        after = self._astra_task_counts()
-        if before is not None and after is not None:
-            d_tasks = after[0] - before[0]
-            d_rems = after[1] - before[1]
-            d_cal = after[2] - before[2]
-            item = items[0]
-            needed_tasks = len(item.get("tasks") or [])
-            if not needed_tasks and not item.get("reminders"):
-                needed_tasks = 1
-            has_deadline = bool(item.get("reminders"))
-            verified = (d_tasks >= needed_tasks
-                        and (not has_deadline or mode == "reminders" or d_cal > 0)
-                        and (not has_deadline or mode == "calendar" or d_rems > 0)
-                        and (d_tasks + d_rems + d_cal) > 0)
-            note = (f" (проверка: создано задач {d_tasks}, напоминаний "
-                    f"{d_rems}, записей в календаре {d_cal})")
-        if not answer:
-            if verified:
-                full = ("Астра создала задачи, не ответив текстом." + note)
-                self._save_handoff_result(True, "", full, items, True)
-                return {"success": True, "answer": full, "verified": True}
-            reason = self._llm_error or "Astra не ответила (пустой ответ)"
-            self._save_handoff_result(False, reason, "", items, None)
-            return {"success": False, "error": reason}
-        if verified is not True:
-            reason = ("Астра ответила, но не создала всех ожидаемых задач, напоминаний или "
-                      "записей в календаре. Письма оставлены для повторной "
-                      "попытки.")
-            if verified is None:
-                reason = "Не удалось проверить создание задач: файлы Astra недоступны."
-            clean = self._clean_handoff_answer(answer)
-            self._save_handoff_result(False, reason, clean, items, verified)
-            return {"success": False, "error": reason, "answer": clean,
-                    "verified": verified}
-        clean = self._clean_handoff_answer(answer)
-        if verified and (not clean or "⟨" in clean):
-            # The reply was a parroted format (triage line / JSON), not a
-            # human sentence — but the counters say the tasks exist. The
-            # tab and the voice announcement get a synthesized readable
-            # message instead of the model's noise.
-            full = "Астра создала задачи по письмам." + note
-        else:
-            full = clean[:2000] + note
-        self._save_handoff_result(True, "", full, items, verified)
-        return {"success": True, "answer": full, "verified": verified}
-
-    def _save_handoff_result(self, ok: bool, error: str, answer: str,
-                             items: List[Dict[str, Any]],
-                             verified: Optional[bool]) -> None:
-        """Persist what the handoff did so the tab can show it (and so the
-        same letters are not re-sent on the next handoff)."""
+    @ui_call("aa_widget_jobs")
+    async def ui_widget_jobs(self, worker: str = "", **params: Any) -> Dict[str, Any]:
+        if not worker or len(worker) > 80:
+            return {"jobs": []}
+        self._bridge_last_seen = time.time()
+        claimed = jobs.claim(worker)
         try:
-            # Handled only when creation is confirmed:
-            # a hallucinated "created" must stay re-sendable.
-            if ok and verified is True:
-                store.mark_digest_handled(
-                    [it.get("id") or f"{it.get('account_id')}:{it['uid']}" for it in items])
-        except Exception:
-            pass
-        try:
-            state = store.load_state()
-            state["handoff_error"] = ("" if ok else str(error)[:300])
-            state["handoff_answer"] = answer[:2000]
-            state["handoff_ts"] = time.time()
-            store.save_state(state)
-        except Exception:
-            pass
+            revision = store.STATE_FILE.stat().st_mtime_ns
+        except OSError:
+            revision = 0
+        return {"jobs": claimed, "revision": revision,
+                "polling": self._poll_lock is not None and self._poll_lock.locked()}
+
+    @ui_call("aa_widget_result")
+    async def ui_widget_result(self, id: str = "", lease: str = "",
+                               success: bool = False, error: str = "", **params: Any) -> Dict[str, Any]:
+        accepted = jobs.finish(id, lease, success is True, error)
+        return {"success": accepted}
+
+    @ui_call("aa_retriage")
+    async def ui_retriage(self, **params: Any) -> Dict[str, Any]:
+        items = [i for i in store.load_state().get("digest", []) if not i.get("handled")][:6]
+        parsed = await self._triage_items(items, store.load_settings())
+        for item in parsed:
+            store.add_digest_item(item)
+        return {"success": not bool(self._llm_error), "error": self._llm_error,
+                "report": f"Переразобрано писем: {len(parsed)}. Создание записей не запускалось."}
 
     # ------------------------------------------------------------------
     # Tools (Astra calls these in chat)
@@ -671,23 +482,11 @@ class AstraAutoAssistant(Plugin):
     # ------------------------------------------------------------------
 
     async def get_ui_contributions(self) -> List[UiContribution]:
-        # super() carries the @ui_page tab — dropping this call removes the
-        # tab from navigation (SDK >= 0.6 keeps pages only in the base method).
-        contributions = await super().get_ui_contributions()
-        icon_path = Path(__file__).resolve().parent.parent / "icon.png"
-        page_icon = None
-        if icon_path.is_file():
-            icon_data = base64.b64encode(icon_path.read_bytes()).decode("ascii")
-            page_icon = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
-                         f'<image width="512" height="512" href="data:image/png;base64,{icon_data}"/>'
-                         '</svg>')
-        for c in contributions:
-            if c.slot == "page.custom":
-                if page_icon:
-                    c.icon_svg = page_icon
-                # Glass theme needs the iframe itself transparent.
-                c.transparent = True
-        return contributions
+        return [self.ui_effect("controller.js", id="native-mail-assistant"),
+                self.ui_page("auto-assistant", "Помощник", "page.js", icon_svg=
+                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+                    '<path fill="none" stroke="currentColor" stroke-width="1.8" '
+                    'd="M3 5h18v14H3zM3 6l9 7 9-7"/></svg>')]
 
     @ui_call("aa_get_state")
     async def ui_get_state(self, **params: Any) -> Dict[str, Any]:
@@ -714,11 +513,14 @@ class AstraAutoAssistant(Plugin):
                 "last_poll": state.get("last_poll") or 0,
                 "last_error": state.get("last_error") or "",
                 "llm_error": self._llm_error,
+                "native_bridge_ready": time.time() - self._bridge_last_seen < 15,
+                "handoff_pending": bool(state.get("handoff_pending")),
                 "handoff_error": state.get("handoff_error") or "",
                 "handoff_answer": state.get("handoff_answer") or "",
                 "next_in_seconds": round(next_in),
                 "poller_alive": self._poller_task is not None
                                 and not self._poller_task.done(),
+                "polling": self._poll_lock is not None and self._poll_lock.locked(),
                 "last_summary": self._last_summary,
             },
         }
@@ -761,14 +563,24 @@ class AstraAutoAssistant(Plugin):
             mx = 20
         settings["max_messages"] = min(max(mx, 1), 100)
 
+        for key in ("llm_endpoint", "llm_model"):
+            settings[key] = str(new.get(key, old.get(key, ""))).strip()[:300]
         old_accounts = {a.get("id"): a for a in old.get("accounts") or []}
         accounts = []
+        id_changes = {}
         for i, a in enumerate(new.get("accounts") or []):
             if not isinstance(a, dict):
                 continue
             acct_id = a.get("id") or f"acct{i}"
+            previous = old_accounts.get(acct_id) or {}
+            changed_mailbox = bool(previous) and (
+                mailer.mailbox_identity(previous) != mailer.mailbox_identity(a))
             password = (a.get("password") or "").strip()
-            if not password:
+            if changed_mailbox:
+                new_id = "acct" + uuid.uuid4().hex
+                id_changes[acct_id] = new_id
+                acct_id = new_id
+            if not password and not changed_mailbox:
                 # Empty field in the UI means "keep the saved password".
                 password = (old_accounts.get(acct_id) or {}).get("password", "")
             wl = a.get("whitelist")
@@ -787,8 +599,15 @@ class AstraAutoAssistant(Plugin):
             })
         settings["accounts"] = accounts
         store.save_settings(settings)
+        def prune_status(state):
+            live_ids = {a["id"] for a in accounts}
+            state["acct_status"] = {k: v for k, v in state.get("acct_status", {}).items()
+                                    if k in live_ids}
+        store.update_state(prune_status)
         self._ensure_poller()
-        return {"success": True}
+        # The client must adopt new ids and discard successfully saved passwords.
+        return {"success": True, "settings": (await self.ui_get_state())["settings"],
+                "account_ids": id_changes}
 
     @ui_call("aa_test_account")
     async def ui_test_account(self, **params: Any) -> Dict[str, Any]:
@@ -796,7 +615,10 @@ class AstraAutoAssistant(Plugin):
         if not (acct.get("password") or "").strip():
             saved = {a.get("id"): a for a in
                      store.load_settings().get("accounts") or []}
-            acct["password"] = (saved.get(acct.get("id")) or {}).get("password", "")
+            previous = saved.get(acct.get("id")) or {}
+            if previous and mailer.mailbox_identity(previous) != mailer.mailbox_identity(acct):
+                return {"error": "Для нового адреса или IMAP-сервера укажи пароль приложения."}
+            acct["password"] = previous.get("password", "")
         try:
             message = await asyncio.to_thread(mailer.test_account, acct)
             return {"success": True, "message": message}
@@ -805,19 +627,45 @@ class AstraAutoAssistant(Plugin):
 
     @ui_call("aa_run_digest")
     async def ui_run_digest(self, **params: Any) -> Dict[str, Any]:
-        report = await self.poll_once(auto=False)
-        return {"success": True, "report": report}
+        return self._start_manual_poll()
+
+    def _start_manual_poll(self, historical: bool = False) -> Dict[str, Any]:
+        if ((self._manual_task is not None and not self._manual_task.done())
+                or self._poll_lock is not None and self._poll_lock.locked()):
+            return {"success": False, "error": "Проверка почты уже выполняется."}
+        async def run():
+            try:
+                await self.poll_once(auto=False, historical=historical)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Manual mail check failed: %s", type(exc).__name__)
+                store.update_state(lambda state: state.update(last_error="Проверка прервана; см. журнал плагина."))
+        self._manual_task = asyncio.create_task(run())
+        return {"success": True, "report": "Проверка запущена. Результат появится в дайджесте."}
 
     @ui_call("aa_handoff")
     async def ui_handoff(self, **params: Any) -> Dict[str, Any]:
         items = self._unhandled_high(48)
         if not items:
-            return {"error": "Нет необработанных важных писем за последние "
-                             "48 часов — задачи по ним уже запрошены у Астры"}
+            return {"error": "Нет подтверждённых действий из свежих писем или писем с будущим сроком. "
+                             "При необходимости разбери последние письма заново."}
         return await self._handoff(items)
 
     @ui_call("aa_rewind_baseline")
     async def ui_rewind_baseline(self, **params: Any) -> Dict[str, Any]:
+        if self._poll_lock is None:
+            self._poll_lock = asyncio.Lock()
+        if (self._poll_lock.locked() or self._manual_task is not None and not self._manual_task.done()):
+            return {"error": "Проверка почты уже выполняется — подожди немного."}
+        async with self._poll_lock:
+            result = await self._rewind_baseline(**params)
+        # poll_once acquires this same lock, so run it only after releasing it.
+        if result.get("success"):
+            result["report"] = self._start_manual_poll(historical=True).get("report", "")
+        return result
+
+    async def _rewind_baseline(self, **params: Any) -> Dict[str, Any]:
         """Re-triage the newest `back` unread letters of every enabled account.
 
         The mail baseline sits at the end of the mailbox (see
@@ -831,8 +679,7 @@ class AstraAutoAssistant(Plugin):
         except (TypeError, ValueError):
             back = 20
         settings = store.load_settings()
-        state = store.load_state()
-        status = state.setdefault("acct_status", {})
+        updates: Dict[str, Any] = {}
         moved: List[str] = []
         errors: List[str] = []
         for acct in settings.get("accounts") or []:
@@ -842,22 +689,27 @@ class AstraAutoAssistant(Plugin):
                 continue
             acct_id = acct.get("id") or acct.get("email")
             try:
-                base = await asyncio.to_thread(mailer.rewind_baseline, acct, back)
+                base, validity = await asyncio.to_thread(mailer.rewind_baseline, acct, back)
             except Exception as e:
                 errors.append(f"{acct.get('email')}: {str(e)[:200]}")
                 continue
             if base is None:
                 continue
-            entry = dict(status.get(acct_id) or {})
-            entry["last_uid"] = int(base)
-            status[acct_id] = entry
+            updates[acct_id] = {"last_uid": int(base), "uidvalidity": validity}
             moved.append(acct.get("email", ""))
         if not moved:
             note = f" Ошибки: {errors[0]}" if errors else ""
             return {"error": "Нечего показывать — непрочитанных писем нет." + note}
-        store.save_state(state)
-        report = await self.poll_once(auto=False)
-        return {"success": True, "report": report, "accounts": moved,
+        def rewind(state):
+            live_ids = {a["id"] for a in store.load_settings()["accounts"]}
+            status = state.setdefault("acct_status", {})
+            for acct_id, update in updates.items():
+                if acct_id in live_ids:
+                    if status.get(acct_id, {}).get("uidvalidity") is None:
+                        store.adopt_uidvalidity(state, acct_id, update["uidvalidity"])
+                    status[acct_id] = {**status.get(acct_id, {}), **update}
+        store.update_state(rewind)
+        return {"success": True, "accounts": moved,
                 "errors": errors}
 
     @ui_call("aa_clear_digest")

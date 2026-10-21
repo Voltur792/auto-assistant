@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+.astra-venv.json
+.impeccable/
 # App passwords and digest live here — never commit.
 data/
 # Store icon ships as icon.png; source artwork (JPG etc.) stays out of the

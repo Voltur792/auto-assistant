@@ -12,8 +12,10 @@ plugin never marks anything as read.
 import email
 import email.policy
 import imaplib
+import time
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Dict, List, Optional
+from .triage import clean
 
 PROVIDER_HOSTS: Dict[str, "tuple[str, int]"] = {
     "yandex": ("imap.yandex.ru", 993),
@@ -23,7 +25,7 @@ PROVIDER_HOSTS: Dict[str, "tuple[str, int]"] = {
 }
 
 _CONNECT_TIMEOUT = 20   # seconds
-_BODY_PREVIEW_CHARS = 700
+_BODY_PREVIEW_CHARS = 4000
 
 
 def resolve_host(account: Dict[str, Any]) -> "tuple[str, int]":
@@ -37,6 +39,19 @@ def resolve_host(account: Dict[str, Any]) -> "tuple[str, int]":
     except (TypeError, ValueError):
         port = default_port
     return host, port
+
+
+def mailbox_identity(account: Dict[str, Any]) -> tuple:
+    host, port = resolve_host(account)
+    return ((account.get("email") or "").strip().casefold(),
+            host.rstrip(".").casefold(), port, "INBOX")
+
+
+def _uidvalidity(conn: imaplib.IMAP4_SSL) -> str:
+    _, data = conn.response("UIDVALIDITY")
+    if not data or not data[0] or not data[0].isdigit() or int(data[0]) <= 0:
+        raise ConnectionError("IMAP-сервер не сообщил UIDVALIDITY папки INBOX")
+    return str(int(data[0]))
 
 
 def _connect(account: Dict[str, Any]) -> imaplib.IMAP4_SSL:
@@ -89,7 +104,7 @@ def _decode_body(msg: Any) -> str:
             content = re.sub(r"(?s)<!--.*?-->", " ", content)
             content = re.sub(r"<[^>]+>", " ", content)
         # Collapse all whitespace: the preview is fed to rules/LLM, not shown raw.
-        return " ".join(content.split())[:_BODY_PREVIEW_CHARS]
+        return clean(content)[:_BODY_PREVIEW_CHARS]
     except Exception:
         return ""
 
@@ -105,7 +120,8 @@ def _uids(typ: Any, data: Any) -> List[int]:
 
 
 def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
-                     limit: int = 20) -> "tuple[List[Dict[str, Any]], int]":
+                     limit: int = 20, since_uidvalidity: Optional[str] = None
+                     ) -> "tuple[List[Dict[str, Any]], int, str]":
     """Unread INBOX messages with UID > `since_uid`, oldest first.
 
     Blocking — run it in a worker thread.
@@ -115,14 +131,15 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
     a "already seen" list built from them quietly swallows new mail — with a
     mailbox of ~20k messages the newest letters kept landing on numbers the
     plugin had stored weeks earlier, and every poll reported "nothing new".
-    A UID is permanent for the life of the mailbox.
+    A UID is permanent within one UIDVALIDITY namespace. A namespace change
+    establishes a new baseline instead of comparing unrelated UID numbers.
 
     `since_uid=None` means "never polled": nothing is returned and the second
     element is the mailbox's current highest UID, which the caller stores as
     the baseline so a fresh install does not spend its first polls triaging
     years of old unread mail.
 
-    Returns `(messages, uid_high)` — `uid_high` is what to store as the new
+    Returns `(messages, uid_high, uidvalidity)` — `uid_high` is the new
     baseline. At most `limit` messages come back, oldest first, so a flood is
     worked through over several polls instead of the older half being dropped.
     Messages are read with BODY.PEEK, so nothing is ever marked as read.
@@ -133,12 +150,15 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
         typ, _ = conn.select("INBOX", readonly=True)
         if typ != "OK":
             raise ConnectionError("Не удалось открыть папку INBOX")
+        validity = _uidvalidity(conn)
+        if since_uidvalidity is not None and str(since_uidvalidity) != validity:
+            since_uid = None  # Same folder name, but a new UID namespace.
         typ, data = conn.uid("search", "ALL")
         if typ != "OK":
             raise ConnectionError("Не удалось получить список писем INBOX")
         mailbox_max = max(_uids(typ, data), default=0)
         if since_uid is None:
-            return out, mailbox_max
+            return out, mailbox_max, validity
         since = int(since_uid)
         typ, data = conn.uid("search", "UNSEEN")
         if typ != "OK":
@@ -153,7 +173,7 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
             # smaller evil.
             for _attempt in (1, 2):
                 try:
-                    typ, msg_data = conn.uid("fetch", str(uid), "(BODY.PEEK[])")
+                    typ, msg_data = conn.uid("fetch", str(uid), "(INTERNALDATE BODY.PEEK[])")
                     if typ == "OK" and msg_data:
                         raw = next((p[1] for p in msg_data
                                     if isinstance(p, tuple)), None)
@@ -171,15 +191,26 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
                 ts = dt.timestamp() if dt else 0.0
             except Exception:
                 ts = 0.0
+            # Use the server's receive date for freshness, not a Date header
+            # supplied by the sender. Keep Date only as a compatibility fallback.
+            date_ts = ts
+            try:
+                metadata = next(p[0] for p in msg_data if isinstance(p, tuple))
+                internal = imaplib.Internaldate2tuple(metadata)
+                if internal is not None:
+                    ts = time.mktime(internal)
+            except (ValueError, TypeError, StopIteration, OverflowError):
+                pass
             out.append({
                 "uid": str(uid),
                 "from_name": from_name or from_addr,
                 "from_addr": from_addr.lower(),
                 "subject": (msg.get("Subject") or "").strip(),
                 "ts": ts,
+                "date_ts": date_ts,
                 "body": _decode_body(msg),
             })
-        return out, max(fresh, default=since)
+        return out, max(fresh, default=since), validity
     finally:
         try:
             conn.logout()
@@ -187,20 +218,26 @@ def fetch_new_emails(account: Dict[str, Any], since_uid: Optional[int],
             pass
 
 
-def rewind_baseline(account: Dict[str, Any], back: int = 20) -> Optional[int]:
+def rewind_baseline(account: Dict[str, Any], back: int = 20
+                    ) -> "tuple[Optional[int], str]":
     """A baseline that makes the newest `back` unread letters look new again.
 
     The mail baseline sits at the end of the mailbox, so letters that were
     already there when the plugin started are never reported — correct for an
     install, but it leaves the tab empty after a fix or a "clear". This
-    returns the UID to rewind to so exactly the newest `back` unread letters
+    returns (UID to rewind to, UIDVALIDITY) so the newest `back` unread letters
     come back (bounded by design: a mailbox with 20k unread letters must not
-    turn into 20k LLM calls). None when the mailbox has no unread letters.
+    turn into 20k LLM calls). The UID is None when there are no unread letters.
     """
     conn = _connect(account)
     try:
-        conn.select("INBOX", readonly=True)
+        typ, _ = conn.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise ConnectionError("Не удалось открыть папку INBOX")
+        validity = _uidvalidity(conn)
         typ, data = conn.uid("search", "UNSEEN")
+        if typ != "OK":
+            raise ConnectionError("Не удалось получить непрочитанные письма")
         unseen = _uids(typ, data)
     finally:
         try:
@@ -208,9 +245,10 @@ def rewind_baseline(account: Dict[str, Any], back: int = 20) -> Optional[int]:
         except Exception:
             pass
     if not unseen:
-        return None
+        return None, validity
     back = max(1, min(int(back), 100))
-    return unseen[0] - 1 if len(unseen) <= back else unseen[-back - 1]
+    base = unseen[0] - 1 if len(unseen) <= back else unseen[-back - 1]
+    return base, validity
 
 
 def test_account(account: Dict[str, Any]) -> str:

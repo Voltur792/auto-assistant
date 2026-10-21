@@ -34,10 +34,15 @@ class FakeIMAP:
         self.unseen = list(unseen_uids)
         self.fetched = []
         self.readonly = None
+        self.validity = b"1"
 
     def select(self, mailbox, readonly=False):
         self.readonly = readonly
         return "OK", [str(len(self.all)).encode()]
+
+    def response(self, name):
+        assert name == "UIDVALIDITY"
+        return name, [self.validity]
 
     def uid(self, command, *args):
         if command == "search" and args == ("ALL",):
@@ -72,23 +77,56 @@ def test_first_run_only_sets_a_baseline(fake):
     # baseline. Otherwise a fresh install spends its first polls reading years
     # of old unread mail through the LLM.
     conn = fake(range(1, 101), [99, 100])
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, None, limit=20)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, None, limit=20)
     assert msgs == [] and high == 100
     assert conn.fetched == []
 
 
+def test_uidvalidity_change_rebases_without_fetching_old_mail(fake):
+    conn = fake([1, 2], [1, 2])
+    conn.validity = b"2"
+    messages, high, validity = mailer.fetch_new_emails(ACCOUNT, 50000, 20, "1")
+    assert messages == [] and high == 2 and validity == "2"
+    conn.all.append(3)
+    conn.unseen.append(3)
+    messages, high, validity = mailer.fetch_new_emails(ACCOUNT, high, 20, validity)
+    assert [m["uid"] for m in messages] == ["3"] and high == 3
+
+
+def test_unknown_uidvalidity_fails_instead_of_guessing_namespace(fake):
+    conn = fake([1], [1])
+    conn.validity = None
+    with pytest.raises(ConnectionError, match="UIDVALIDITY"):
+        mailer.fetch_new_emails(ACCOUNT, 0)
+
+
 def test_only_unseen_uids_above_the_baseline_are_returned(fake):
     fake(range(1, 106), [101, 102, 105])
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=20)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, 100, limit=20)
     assert [m["uid"] for m in msgs] == ["101", "102", "105"]
     assert msgs[0]["subject"] == "Письмо 101"
     assert msgs[0]["from_addr"] == "boss@example.com"
     assert high == 105
 
 
+def test_server_receive_date_takes_precedence_over_sender_header(fake, monkeypatch):
+    conn = fake([1], [1])
+    original = conn.uid
+    def uid(command, *args):
+        if command == 'fetch':
+            assert 'INTERNALDATE' in args[1] and 'BODY.PEEK' in args[1]
+            return 'OK', [(b'1 (INTERNALDATE "21-Oct-2026 12:00:00 +0500" BODY[] {1}', _raw(1)), b')']
+        return original(command, *args)
+    monkeypatch.setattr(conn, 'uid', uid)
+    from datetime import datetime
+    messages, _, _ = mailer.fetch_new_emails(ACCOUNT, 0)
+    assert messages[0]['ts'] == datetime.fromisoformat('2026-10-21T12:00:00+05:00').timestamp()
+    assert messages[0]['date_ts'] < messages[0]['ts']
+
+
 def test_limit_keeps_the_oldest_and_leaves_the_rest_for_next_poll(fake):
     fake(range(1, 106), [101, 102, 103, 104, 105])
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=2)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, 100, limit=2)
     assert [m["uid"] for m in msgs] == ["101", "102"]
     assert high == 102          # 103..105 are still above the baseline
 
@@ -96,19 +134,19 @@ def test_limit_keeps_the_oldest_and_leaves_the_rest_for_next_poll(fake):
 def test_letters_read_elsewhere_are_not_fetched(fake):
     # 101 and 102 were read on the phone before the poll ran.
     fake(range(1, 106), [103])
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=20)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, 100, limit=20)
     assert [m["uid"] for m in msgs] == ["103"] and high == 103
 
 
 def test_nothing_new_leaves_the_baseline_untouched(fake):
     fake(range(1, 106), [101, 102])
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, 102, limit=20)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, 102, limit=20)
     assert msgs == [] and high == 102
 
 
 def test_empty_mailbox_baseline_is_zero(fake):
     fake([], [])
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, None, limit=20)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, None, limit=20)
     assert msgs == [] and high == 0
 
 
@@ -122,18 +160,18 @@ def test_inbox_is_selected_readonly(fake):
 def test_rewind_is_bounded_by_how_many_letters_were_asked(fake):
     # 20k unread letters must never become 20k LLM calls, whatever `back` says.
     fake(range(1, 20_001), list(range(1, 20_001)))
-    assert mailer.rewind_baseline(ACCOUNT, 20) == 19_980
-    assert mailer.rewind_baseline(ACCOUNT, 1000) == 19_900   # clamped to 100
+    assert mailer.rewind_baseline(ACCOUNT, 20) == (19_980, "1")
+    assert mailer.rewind_baseline(ACCOUNT, 1000) == (19_900, "1")   # clamped to 100
 
 
 def test_rewind_with_fewer_unread_than_asked_takes_them_all(fake):
     fake(range(1, 101), [10, 11, 12])
-    assert mailer.rewind_baseline(ACCOUNT, 20) == 9
+    assert mailer.rewind_baseline(ACCOUNT, 20) == (9, "1")
 
 
 def test_rewind_on_a_mailbox_without_unread_returns_none(fake):
     fake(range(1, 101), [])
-    assert mailer.rewind_baseline(ACCOUNT, 20) is None
+    assert mailer.rewind_baseline(ACCOUNT, 20) == (None, "1")
 
 
 def test_a_letter_that_fails_to_fetch_is_retried_then_skipped(monkeypatch):
@@ -156,7 +194,7 @@ def test_a_letter_that_fails_to_fetch_is_retried_then_skipped(monkeypatch):
 
     conn = FlakyIMAP()
     monkeypatch.setattr(mailer, "_connect", lambda account: conn)
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=10)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, 100, limit=10)
     assert [m["uid"] for m in msgs] == ["101", "103"]   # 102 skipped...
     assert conn.fetch_attempts[102] == 2                # ...after a retry
     assert high == 103                                   # and the queue flows
@@ -177,7 +215,7 @@ def test_a_transient_fetch_glitch_is_covered_by_the_retry(monkeypatch):
 
     conn = OnceIMAP()
     monkeypatch.setattr(mailer, "_connect", lambda account: conn)
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=10)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, 100, limit=10)
     assert [m["uid"] for m in msgs] == ["101", "102"]
     assert high == 102
 
@@ -201,7 +239,7 @@ def test_html_style_and_script_do_not_leak_into_the_body(monkeypatch):
 
     conn = HtmlIMAP([5], [5])
     monkeypatch.setattr(mailer, "_connect", lambda account: conn)
-    msgs, _ = mailer.fetch_new_emails(ACCOUNT, 0, limit=5)
+    msgs, _, _ = mailer.fetch_new_emails(ACCOUNT, 0, limit=5)
     assert msgs[0]["body"] == "Настоящий текст письма"
 
 
@@ -214,9 +252,9 @@ def test_poison_letter_at_limit_one_does_not_block_later_mail(monkeypatch):
 
     conn = PoisonIMAP([101, 102], [101, 102])
     monkeypatch.setattr(mailer, "_connect", lambda account: conn)
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, 100, limit=1)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, 100, limit=1)
     assert msgs == [] and high == 101
-    msgs, high = mailer.fetch_new_emails(ACCOUNT, high, limit=1)
+    msgs, high, _ = mailer.fetch_new_emails(ACCOUNT, high, limit=1)
     assert [m["uid"] for m in msgs] == ["102"] and high == 102
 
 

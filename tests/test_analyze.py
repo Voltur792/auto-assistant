@@ -1,20 +1,9 @@
-"""Offline tests for the triage layer and the store (no daemon, no sockets)."""
-
+"""Rules, allow-list and persistence: offline and isolated."""
 import json
-import sys
 import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import pytest
-
 from src import analyze, store
 
-
-# ---------------------------------------------------------------------------
-# analyze.py
-# ---------------------------------------------------------------------------
 
 def test_whitelist_substring_case_insensitive():
     acct = {"whitelist": ["Bank.RU", "ivanov"]}
@@ -61,96 +50,6 @@ def test_bulk_senders_are_narrow():
                  "mailer@service.io"):
         assert not analyze.is_bulk(addr)
 
-
-def test_own_mail_is_recognized():
-    # Регресс: тестовое письмо от самого себя правила звали «обычным» —
-    # слова «тест»/«собрание» в _HIGH_WORDS нет, и LLM тоже сказал normal.
-    accounts = [{"email": "me@ya.ru"}, {"email": "Me@Gmail.com "}]
-    assert analyze.is_own_mail("me@ya.ru", accounts)
-    assert analyze.is_own_mail("ME@GMAIL.COM", accounts)   # регистр/пробелы
-    assert not analyze.is_own_mail("boss@company.com", accounts)
-    assert not analyze.is_own_mail("", accounts)
-
-
-def test_parse_llm_answer_plain_and_chatty():
-    payload = '{"items": [{"n": 1, "importance": "high", "summary": "Оплатить счёт", "tasks": ["Оплатить"], "reminders": ["до пятницы"]}]}'
-    assert analyze.parse_llm_answer(payload)[0]["importance"] == "high"
-    wrapped = f"Вот результат:\n```json\n{payload}\n```\nГотово!"
-    assert analyze.parse_llm_answer(wrapped)[0]["tasks"] == ["Оплатить"]
-    assert analyze.parse_llm_answer("никакого json") is None
-    assert analyze.parse_llm_answer("") is None
-
-
-def test_parse_llm_answer_line_format():
-    # The triage prompt now asks for pipe-separated LINES (JSON replies in
-    # the plugin conversation taught the model to answer the handoff with
-    # tool-call JSON as text). Non-matching lines are skipped.
-    reply = ("Вот разбор:\n"
-             "1 | high | Счёт, оплатить до 20.09 | Оплатить счёт; Проверить сумму | 20.09\n"
-             "2 | low | Рассылка магазина | - | -\n"
-             "болтовня мимо формата")
-    parsed = analyze.parse_llm_answer(reply)
-    assert parsed[0]["importance"] == "high"
-    assert parsed[0]["tasks"] == ["Оплатить счёт", "Проверить сумму"]
-    assert parsed[0]["reminders"] == ["20.09"]
-    assert parsed[1]["importance"] == "low"
-    assert parsed[1]["tasks"] == [] and parsed[1]["reminders"] == []
-    # Russian importance synonyms are understood.
-    ru = "1 | важное | Собрание | Подготовиться | завтра 15:00"
-    assert analyze.parse_llm_answer(ru)[0]["importance"] == "high"
-    assert analyze.parse_llm_answer(ru)[0]["reminders"] == ["завтра 15:00"]
-
-
-def test_llm_prompt_asks_for_lines_not_json():
-    prompt = analyze.build_llm_prompt(
-        [{"from_name": "Иван", "from_addr": "i@x.ru", "subject": "Счёт",
-          "body": "оплатить счёт"}])
-    assert "номер | важность" in prompt
-    assert "без JSON" in prompt
-    assert "{" not in prompt and "}" not in prompt
-    assert "Счёт" in prompt
-
-
-def test_parse_llm_answer_sanitizes():
-    bad = '{"items": [{"n": "x", "importance": "MEGA", "summary": 42, "tasks": "одна задача", "reminders": null}]}'
-    parsed = analyze.parse_llm_answer(bad)
-    assert parsed[0]["importance"] == "normal"
-    assert parsed[0]["tasks"] == ["одна задача"]
-    assert parsed[0]["reminders"] == []
-
-
-def test_merge_llm_falls_back_per_item():
-    items = [{"subject": "Счёт", "body": "оплатить в срок счёт"},
-             {"subject": "Мим", "body": "мим"}]
-    parsed = [{"n": 2, "importance": "low", "summary": "мем", "tasks": [], "reminders": []}]
-    merged = analyze.merge_llm(items, parsed)
-    assert merged[0]["importance"] == "high"      # rules filled the gap
-    assert merged[1]["importance"] == "low"       # LLM verdict kept
-    merged_none = analyze.merge_llm(items, None)  # LLM totally failed
-    assert len(merged_none) == 2
-
-
-def test_merge_llm_partial_batch_prefiltered_ads():
-    # Token economy: obvious-ads items are prefiltered by rules and never
-    # reach the LLM; prompt numbering only covers the LLM batch.
-    items = [{"subject": "Счёт", "body": "оплатить задолженность в срок"},
-             {"subject": "Скидки", "body": "скидка 50% распродажа"},
-             {"subject": "Отчёт", "body": "нужно сдать отчёт до 20.09"}]
-    parsed = [{"n": 1, "importance": "high", "summary": "счёт", "tasks": ["оплатить"], "reminders": []},
-              {"n": 2, "importance": "high", "summary": "отчёт", "tasks": [], "reminders": ["до 20.09"]}]
-    merged = analyze.merge_llm(items, parsed, llm_idx=[0, 2])  # ad (idx 1) skipped
-    assert merged[0]["summary"] == "счёт"          # LLM n=1 -> items[0]
-    assert merged[1]["importance"] == "low"        # rules verdict, no LLM call
-    assert merged[2]["reminders"] == ["до 20.09"]  # LLM n=2 -> items[2]
-    # Nothing sent to LLM at all (all ads): everything falls back to rules.
-    all_ads = analyze.merge_llm(items, None, llm_idx=[])
-    assert all_ads[0]["importance"] == "high"
-    assert all_ads[1]["importance"] == "low"
-
-
-# ---------------------------------------------------------------------------
-# store.py (isolated via monkeypatched paths)
-# ---------------------------------------------------------------------------
 
 @pytest.fixture()
 def store_env(tmp_path, monkeypatch):
@@ -272,76 +171,6 @@ def test_acct_status_roundtrip(store_env):
     again = store.load_state()
     assert again["acct_status"]["a1"]["new_count"] == 2
     assert again["acct_status"]["a2"]["last_error"] == "auth failed"
-
-
-def test_handoff_prompt_names_core_tools():
-    # The prompt must name the exact core tool ids and their real parameter
-    # names (from successful calls in the daemon log: add_task(text),
-    # add_reminder(text, time)) — a small model behind tool-search
-    # compaction never sees these tools in its list and needs to be told.
-    prompt = analyze.build_handoff_prompt(
-        [{"from_name": "Иван", "subject": "Отчёт",
-          "tasks": ["Сдать отчёт"], "reminders": ["до 18:00"]}],
-        deadline_mode="reminders")
-    assert "core:add_task" in prompt
-    assert "core:add_reminder" in prompt
-    assert "reminder_text" not in prompt          # no invented params
-    # Direct per-letter call instructions with the real parameter name.
-    assert "text: Сдать отчёт" in prompt
-    # Today in both formats so the model does not guess the date.
-    import time as _time
-    assert _time.strftime("%d.%m.%Y") in prompt
-    assert _time.strftime("%Y-%m-%d") in prompt
-    assert "Отчёт" in prompt
-    assert "Сдать отчёт" in prompt
-    assert "до 18:00" in prompt
-    # NO JSON call examples: the model parroted them as a text answer
-    # instead of calling the tools (seen twice in the wild).
-    assert "{" not in prompt and "}" not in prompt
-    assert "arguments" not in prompt
-
-
-def test_handoff_prompt_carries_the_letter_text_when_no_tasks_were_extracted():
-    # Regression (19.09, real): a high letter with tasks: [] went to the
-    # handoff as a bare "— От Фотин Максим:" (empty subject, no body) — the
-    # model had literally nothing to create and honestly answered
-    # {"items": []}. The prompt must carry the letter's body (or summary)
-    # and tell the model to formulate tasks itself.
-    prompt = analyze.build_handoff_prompt(
-        [{"from_name": "Фотин Максим", "subject": "", "body": "завтра собрание",
-          "summary": "сообщение о собрании", "tasks": [], "reminders": []}])
-    assert "завтра собрание" in prompt
-    assert "сформулируй задачи сам" in prompt
-    # A letter WITH extracted tasks needs no body dump — the tasks are the
-    # instruction; only the summary line stays out of the way.
-    prompt2 = analyze.build_handoff_prompt(
-        [{"from_name": "Иван", "subject": "Отчёт", "body": "текст письма",
-          "tasks": ["Сдать отчёт"], "reminders": []}])
-    assert "текст письма" not in prompt2
-    assert "text: Сдать отчёт" in prompt2
-    # No body and no tasks — the summary is the fallback.
-    prompt3 = analyze.build_handoff_prompt(
-        [{"from_name": "Иван", "subject": "Счёт", "summary": "оплата до 20.09",
-          "tasks": [], "reminders": []}])
-    assert "оплата до 20.09" in prompt3
-
-
-def test_handoff_prompt_calendar_mode():
-    # calendar.json holds {date, text, time}; the calendar mode must name
-    # core:add_calendar_event with an ISO date and no reminders.
-    prompt = analyze.build_handoff_prompt(
-        [{"from_name": "Иван", "subject": "Собрание",
-          "tasks": ["Отчёт"], "reminders": ["завтра в 11:00 собрание"]}],
-        deadline_mode="calendar")
-    assert "core:add_calendar_event" in prompt
-    assert "core:add_reminder" not in prompt
-    assert "запись в календаре" in prompt
-    assert "ГГГГ-ММ-ДД" in prompt               # ISO date format spelled out
-    assert "{" not in prompt                     # no JSON to parrot
-    assert "разобрав дату и время" in prompt
-    prompt_both = analyze.build_handoff_prompt([], deadline_mode="both")
-    assert "core:add_calendar_event" in prompt_both
-    assert "core:add_reminder" in prompt_both
 
 
 def test_mark_digest_handled(store_env):
