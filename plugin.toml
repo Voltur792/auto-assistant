@@ -1,7 +1,7 @@
 [plugin]
 id = "auto-assistant"
 name = "Auto Assistant"
-version = "1.2.1"
+version = "1.2.2"
 description = "Reads mail over IMAP, finds actionable important messages with a local model, and creates tasks, reminders and calendar events in Astra's native widgets."
 author = "Voltur"
 license = "MIT"

@@ -1,6 +1,6 @@
 [project]
 name = "auto_assistant"
-version = "1.2.1"
+version = "1.2.2"
 description = "An Astra plugin"
 requires-python = ">=3.10"
 dependencies = [
